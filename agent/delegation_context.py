@@ -80,9 +80,20 @@ def is_delegated_child_process_context() -> bool:
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Return *env* with dispatcher-only Kanban variables removed and the lineage marker set."""
-    cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
+    cleaned = {key: value for key, value in env.items() if key not in KANBAN_ENV_KEYS}
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
+
+
+def scrub_kanban_identity_env(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Return *env* without dispatcher-owned Kanban identity or capability."""
+    return {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("HERMES_KANBAN_")
+    }
 
 
 def delegated_child_subprocess_env(

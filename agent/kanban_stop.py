@@ -19,7 +19,14 @@ def kanban_stop_nudge_enabled() -> bool:
     """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it."""
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
-    return bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
 
 
 def _tool_call_name(tc: Any) -> str:

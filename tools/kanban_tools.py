@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import registry, tool_error
+from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -66,16 +66,18 @@ def _visible(*, to_env_worker: bool) -> bool:
     (HERMES_KANBAN_TASK) per flag; else the profile toolset decides."""
     if _is_delegated_child_context():
         return False
-    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
-        return to_env_worker
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return to_env_worker if _is_dispatcher_owned_worker() else False
     return _profile_has_kanban_toolset()
 
 
+@no_cache_check_fn
 def _check_kanban_mode() -> bool:
     """Lifecycle tools: dispatcher workers + profiles with the ``kanban`` toolset."""
     return _visible(to_env_worker=True)
 
 
+@no_cache_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
     return _visible(to_env_worker=False)
@@ -115,14 +117,18 @@ def _kanban_handler(tool_name: str) -> Callable:
     return deco
 
 
-def _reject_delegated_child_mutation(tool_name: str) -> None:
-    """A delegate_task child shares the parent's process, so inherited HERMES_KANBAN_*
-    env is not proof of ownership: it may report findings but must not mutate."""
+def _reject_non_owner_mutation(tool_name: str) -> None:
+    """Inherited ``HERMES_KANBAN_*`` is not authority for child or cron runs."""
     if _is_delegated_child_context():
         raise _Reject(
             f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
             "Return findings to the parent agent; the dispatcher worker or an explicitly "
             "configured Kanban orchestrator must perform board mutations.")
+    if os.environ.get("HERMES_KANBAN_TASK") and not _is_dispatcher_owned_worker():
+        raise _Reject(
+            f"{tool_name} refused: this execution does not own the inherited "
+            "Kanban worker identity."
+        )
 
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
@@ -180,7 +186,7 @@ def _enforce_worker_task_ownership(tid: str) -> None:
 def _worker_guard(tool_name: str, args: dict) -> str:
     """Worker mutation preamble, in order: delegate-child rejection, task id
     resolution, task-scope ownership. Returns the task id."""
-    _reject_delegated_child_mutation(tool_name)
+    _reject_non_owner_mutation(tool_name)
     tid = _require_task_id(args)
     _enforce_worker_task_ownership(tid)
     return tid
@@ -681,7 +687,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 @_kanban_handler("kanban_comment")
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
-    _reject_delegated_child_mutation("kanban_comment")
+    _reject_non_owner_mutation("kanban_comment")
     tid = args.get("task_id")
     _check(tid, "task_id is required (use the current task id if that's what "
                 "you mean — pulls from env but kept explicit here)")
@@ -803,7 +809,7 @@ def _handle_attachments(args: dict, **kw) -> str:
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
-    _reject_delegated_child_mutation("kanban_create")
+    _reject_non_owner_mutation("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
@@ -921,7 +927,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 @_kanban_handler("kanban_unblock")
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task to ready, or todo while parents remain open."""
-    _reject_delegated_child_mutation("kanban_unblock")
+    _reject_non_owner_mutation("kanban_unblock")
     _require_orchestrator_tool("kanban_unblock")
     tid = args.get("task_id")
     _check(tid, "task_id is required")
@@ -935,7 +941,7 @@ def _handle_unblock(args: dict, **kw) -> str:
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
-    _reject_delegated_child_mutation("kanban_link")
+    _reject_non_owner_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")

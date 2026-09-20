@@ -7,6 +7,7 @@ from ctypes import wintypes
 import subprocess
 import sys
 import threading
+import time
 
 import psutil
 
@@ -43,6 +44,19 @@ class _ExtendedLimits(ctypes.Structure):
     ]
 
 
+class _BasicAccounting(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_longlong),
+        ("TotalKernelTime", ctypes.c_longlong),
+        ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+        ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+        ("TotalPageFaultCount", wintypes.DWORD),
+        ("TotalProcesses", wintypes.DWORD),
+        ("ActiveProcesses", wintypes.DWORD),
+        ("TotalTerminatedProcesses", wintypes.DWORD),
+    ]
+
+
 class _WindowsJob:
     def __init__(self):
         self._lock = threading.Lock()
@@ -52,6 +66,9 @@ class _WindowsJob:
             ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int,
                                          ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
             ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                           wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
         ):
             fn = getattr(self._api, name)
@@ -84,6 +101,32 @@ class _WindowsJob:
                 if not self._api.CloseHandle(self._handle):
                     raise ctypes.WinError(ctypes.get_last_error())
                 self._handle = None
+
+    def terminate_and_wait(self, timeout: float = 10) -> bool:
+        """Terminate every contained process and close only after proving extinction.
+
+        A false result deliberately retains the Job handle: KILL_ON_JOB_CLOSE keeps
+        containment fail-closed and a later dispatcher tick can retry the proof.
+        """
+        with self._lock:
+            if self._handle is None:
+                return True
+            if not self._api.TerminateJobObject(self._handle, 1):
+                return False
+            deadline = time.monotonic() + timeout
+            while True:
+                accounting = _BasicAccounting()
+                if not self._api.QueryInformationJobObject(
+                        self._handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+                    return False
+                if accounting.ActiveProcesses == 0:
+                    if not self._api.CloseHandle(self._handle):
+                        return False
+                    self._handle = None
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
 
 
 def spawn_server(cmd, **kwargs) -> tuple[subprocess.Popen, _WindowsJob | None]:

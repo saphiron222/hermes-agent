@@ -189,10 +189,24 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+# Windows has no ``waitpid(-1)``: retain both the exact process handle and its
+# kill-on-close Job until the complete worker tree is proven extinct.
 _live_worker_procs: "dict[int, subprocess.Popen]" = {}
+_live_worker_jobs: "dict[int, Any]" = {}
+
+
+def _spawn_windows_worker(cmd, **kwargs) -> subprocess.Popen:
+    """Spawn suspended, assign to a Job, then resume without an escape window."""
+    from hermes_cli.local_runtime.processes import spawn_server
+
+    proc, job = spawn_server(cmd, **kwargs)
+    if job is None:
+        proc.kill()
+        proc.wait(timeout=10)
+        raise RuntimeError("Windows worker spawned without Job Object containment")
+    _live_worker_procs[proc.pid] = proc
+    _live_worker_jobs[proc.pid] = job
+    return proc
 
 
 def _wait_status_from_returncode(returncode: int) -> int:
@@ -283,8 +297,12 @@ def reap_worker_zombies() -> "list[int]":
             returncode = proc.poll()
             if returncode is None:
                 continue
+            job = _live_worker_jobs.get(pid)
+            if job is None or not job.terminate_and_wait():
+                continue
             _record_worker_exit(pid, _wait_status_from_returncode(returncode))
             _live_worker_procs.pop(pid, None)
+            _live_worker_jobs.pop(pid, None)
             reaped.append(pid)
         return reaped
     try:
@@ -447,50 +465,26 @@ def _reap_worker_pid(pid: int) -> None:
 
 
 def _terminate_windows_crashed_worker_tree(pid: int, started_at, info: dict[str, Any]) -> dict[str, Any]:
-    """Terminate descendants of an exited Windows worker while its exact Popen handle is retained."""
+    """Terminate an atomically-contained Windows worker tree and prove extinction."""
     proc = _live_worker_procs.get(pid)
-    if proc is None or started_at in (None, UNVERIFIED_WORKER_FINGERPRINT):
+    job = _live_worker_jobs.get(pid)
+    if proc is None or job is None or started_at in (None, UNVERIFIED_WORKER_FINGERPRINT):
         info["signal_refused"] = True
         info["identity_unreadable"] = True
         return info
+    info["termination_attempted"] = True
     try:
-        import psutil  # type: ignore
-
-        root_started = int(str(started_at).rsplit("|", 1)[-1])
-        rows = list(psutil.process_iter(["pid", "ppid", "create_time"]))
-        by_parent: dict[int, list[Any]] = {}
-        for child in rows:
-            # A stale process whose recorded parent number predates this exact worker is not ours.
-            if int(round(float(child.info["create_time"] or 0) * 100)) < root_started:
-                continue
-            by_parent.setdefault(int(child.info["ppid"] or 0), []).append(child)
-        descendants: list[Any] = []
-        frontier = [pid]
-        while frontier:
-            parent = frontier.pop()
-            for child in by_parent.get(parent, ()):
-                descendants.append(child)
-                frontier.append(int(child.pid))
+        extinct = job.terminate_and_wait()
     except Exception:
-        info["signal_refused"] = True
-        info["identity_unreadable"] = True
-        return info
-
-    info["termination_attempted"] = bool(descendants)
-    for child in reversed(descendants):
-        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            child.terminate()
-    _gone, alive = psutil.wait_procs(descendants, timeout=0.5)
-    for child in alive:
-        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            child.kill()
-    _gone, alive = psutil.wait_procs(alive, timeout=0.5)
-    if alive:
+        extinct = False
+    if not extinct:
         return info
     returncode = proc.poll()
-    if returncode is not None:
-        _record_worker_exit(pid, _wait_status_from_returncode(returncode))
-        _live_worker_procs.pop(pid, None)
+    if returncode is None:
+        return info
+    _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+    _live_worker_procs.pop(pid, None)
+    _live_worker_jobs.pop(pid, None)
     info["terminated"] = True
     return info
 
@@ -3026,17 +3020,20 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    popen_kwargs = {
+        "cwd": workspace if os.path.isdir(workspace) else None,
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_f,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+        "start_new_session": True,
+        "creationflags": subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+    }
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
-        )
+        if _kb._IS_WINDOWS:
+            proc = _spawn_windows_worker(cmd, **popen_kwargs)
+        else:
+            proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
@@ -3045,8 +3042,6 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
     return proc.pid
 
 

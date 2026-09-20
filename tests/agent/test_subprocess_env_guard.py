@@ -13,7 +13,8 @@ This test greps the source tree for ``os.environ.copy()`` appearing within
 hit is in the explicit allowlist below.  If you are adding a new spawn site:
 
 * use ``build_subprocess_env(...)`` — with ``scrub_secrets=False,
-  inherit_profile_home=False`` if you need today's exact-inherit behavior; or
+  inherit_profile_home=False`` if you need today's exact-inherit behavior except
+  for dispatcher-owned ``HERMES_KANBAN_*`` authority; or
 * consciously add the file to ``ALLOWED_RAW_SPAWN_ENV_FILES`` with a comment
   explaining why the factory cannot be used.
 """
@@ -97,8 +98,8 @@ def test_no_new_raw_environ_copy_spawn_sites():
         "New raw os.environ.copy() spawn-env site(s) found:\n  "
         + "\n  ".join(offenders)
         + "\nUse tools.environments.local.build_subprocess_env() instead "
-        "(scrub_secrets=False, inherit_profile_home=False preserves exact "
-        "legacy behavior), or consciously extend "
+        "(scrub_secrets=False, inherit_profile_home=False preserves legacy "
+        "behavior except HERMES_KANBAN_* authority), or consciously extend "
         "ALLOWED_RAW_SPAWN_ENV_FILES in this test with a justification."
     )
 

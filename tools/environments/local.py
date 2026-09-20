@@ -335,9 +335,11 @@ def build_subprocess_env(
     scrub_secrets: bool = True, extra: "Mapping[str, str] | None" = None) -> dict[str, str]:
     """Single factory for child-process envs. ``base=None`` snapshots ``os.environ``.
     ``scrub_secrets=True`` -> :func:`_sanitize_subprocess_env` (profile home inherent,
-    ``inherit_profile_home`` ignored). ``scrub_secrets=False`` keeps the base
-    byte-for-byte (git credential flows, ``bws``/``op``); ``inherit_profile_home``
-    bridges HERMES_HOME + HOME and ``extra`` is applied last so caller overrides win."""
+    ``inherit_profile_home`` ignored). ``scrub_secrets=False`` keeps all non-Kanban
+    keys byte-for-byte (git credential flows, ``bws``/``op``); dispatcher-owned
+    ``HERMES_KANBAN_*`` authority never crosses a child-process boundary.
+    ``inherit_profile_home`` bridges HERMES_HOME + HOME and ``extra`` is applied before
+    that Kanban guard."""
     env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
     if scrub_secrets:
         return _sanitize_subprocess_env(env, dict(extra) if extra else None)
@@ -345,7 +347,9 @@ def build_subprocess_env(
         _apply_profile_home(env)
     if extra:
         env.update(extra)
-    return env
+    from agent.delegation_context import scrub_kanban_identity_env
+
+    return scrub_kanban_identity_env(env)
 
 
 # --- Shell discovery ---

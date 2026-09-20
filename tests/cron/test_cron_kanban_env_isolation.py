@@ -29,7 +29,10 @@ is left completely untouched.
 from __future__ import annotations
 
 import ast
+import json
 import os
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -228,6 +231,44 @@ class TestKanbanGatesRespectContext:
 
         assert not any(key.startswith("HERMES_KANBAN_") for key in child_env)
         assert child_env["HERMES_HOME"] == "/tmp/profile-home"
+
+    def test_no_scrub_cron_child_drops_all_kanban_vars_only(
+        self, monkeypatch, worker_env
+    ):
+        """The mono-profile external worker uses the no-scrub factory path."""
+        from tools.environments.local import build_subprocess_env
+
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        monkeypatch.setenv("HERMES_KANBAN_FUTURE_CAPABILITY", "must-not-leak")
+        monkeypatch.setenv("CRON_NO_SCRUB_SENTINEL", "must-survive")
+        parent_before = dict(os.environ)
+
+        child_env = build_subprocess_env(scrub_secrets=False)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os; "
+                    "print(json.dumps({"
+                    "'kanban': sorted(k for k in os.environ if k.startswith('HERMES_KANBAN_')), "
+                    "'home': os.environ.get('HERMES_HOME'), "
+                    "'sentinel': os.environ.get('CRON_NO_SCRUB_SENTINEL')}))"
+                ),
+            ],
+            env=child_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(probe.stdout)
+
+        assert observed == {
+            "kanban": [],
+            "home": "/tmp/profile-home",
+            "sentinel": "must-survive",
+        }
+        assert dict(os.environ) == parent_before
 
     def test_complete_does_not_default_to_worker_task(self, worker_env):
         """The damage path: kanban_complete must not inherit the task id."""

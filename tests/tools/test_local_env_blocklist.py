@@ -1330,8 +1330,8 @@ class TestPythonhomeSanitized:
 
     def test_build_subprocess_env_no_scrub_preserves_pythonhome(self):
         """``build_subprocess_env(scrub_secrets=False)`` is the documented
-        byte-for-byte escape hatch: no key is removed, so PYTHONHOME (and
-        everything else) survives there by contract, not by omission.
+        no-secret-scrub escape hatch: PYTHONHOME and unrelated keys survive by
+        contract; only dispatcher-owned ``HERMES_KANBAN_*`` authority is removed.
 
         Callers that explicitly opt out of scrubbing (git credential flows,
         secret CLIs) must not have their environment silently altered — this

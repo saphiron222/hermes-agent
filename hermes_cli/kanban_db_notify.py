@@ -96,6 +96,20 @@ def add_notify_sub(
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
+
+    # Correctif local (19/09/2026) — le canal suit le DEPOT, pas l'appelant.
+    # Ce point est le goulot des cinq chemins d'ecriture (kanban_tools, kanban,
+    # slash_commands, plugin_api, heritage). Un cron routait par ASSIGNE toutes
+    # les 30 min et reecrivait tout a l'envers : la regle doit vivre ici, pas
+    # dans une prose que chaque appelant peut ignorer.
+    _canal = _kb._canal_pour_workspace(
+        (lambda r: r["workspace_path"] if r is not None else None)(
+            conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+    )
+    if _canal:
+        notifier_profile = _canal
+
     with _kb.write_txn(conn):
         conn.execute(
             """
@@ -116,7 +130,9 @@ def add_notify_sub(
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
             ("user_id_alt", user_id_alt, True),
-            ("notifier_profile", notifier_profile, True),
+            # fill_only=False : une colonne au MAUVAIS profil doit etre corrigee,
+            # pas seulement une colonne vide (c'est ce qui laissait 97 lignes fausses).
+            ("notifier_profile", notifier_profile, False),
             ("delivery_mode", valid_mode, False),
             ("delivery_metadata", metadata_json, False),
         ):

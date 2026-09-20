@@ -1414,6 +1414,62 @@ def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]
     return [p for p in ids if p not in present]
 
 
+# Correctif local (19/09/2026) — le canal de notification suit le SUJET, jamais le parent.
+#
+# `_inherit_notify_subs` recopiait `notifier_profile` verbatim : une carte `dev` qui
+# engendrait des enfants sur le site leur transmettait son canal, et le travail du site
+# venait parler dans le canal produit. Le defaut est mecanique et se reproduisait a
+# chaque decomposition. Ici on corrige apres la copie, d'apres le depot du workspace.
+#
+# Editer cette table pour ajouter un depot ; une entree non listee garde le canal herite.
+CANAL_PAR_DEPOT: tuple[tuple[str, str], ...] = (
+    ("/memlia-landing", "marketing"),
+    ("/memlia-desk", "dev"),
+    ("/dev/produit/", "dev"),
+    ("/dev/produit-banque/", "dev"),
+    ("/memlia-vault", "default"),
+    ("/.hermes", "default"),
+    ("/memlia-fiscal", "default"),
+)
+# Volontairement ABSENT : "/dev/interne" nu. Le test est une sous-chaine, et ce
+# dossier contient aussi memlia-facturation, previsionnel et specs — une ligne
+# fourre-tout y enverrait tout le canal marketing. On route depot par depot.
+
+
+def _canal_pour_workspace(workspace_path: Optional[str]) -> Optional[str]:
+    """Profil qui doit notifier, deduit du depot ou la carte travaille.
+
+    ``None`` quand le chemin est vide ou ne correspond a aucun depot connu : on
+    laisse alors le canal herite du parent, comportement d'origine.
+    """
+    if not workspace_path:
+        return None
+    for motif, profil in CANAL_PAR_DEPOT:
+        if motif in workspace_path:
+            return profil
+    return None
+
+
+def _corriger_canal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Force le canal des abonnements d'une carte sur celui de son depot.
+
+    Sans effet quand le depot n'est pas dans ``CANAL_PAR_DEPOT`` : le canal pose
+    explicitement est alors conserve. Retourne le canal applique, ou ``None``.
+    """
+    ligne = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    canal = _canal_pour_workspace(ligne["workspace_path"] if ligne is not None else None)
+    if not canal:
+        return None
+    conn.execute(
+        "UPDATE kanban_notify_subs SET notifier_profile = ? "
+        " WHERE task_id = ? AND COALESCE(notifier_profile, '') <> ?",
+        (canal, task_id, canal),
+    )
+    return canal
+
+
 def _inherit_notify_subs(
     conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
     created_at: Optional[int] = None,
@@ -1430,6 +1486,9 @@ def _inherit_notify_subs(
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
+        # Une carte racine n'herite de rien, mais son canal doit quand meme
+        # suivre son depot : la sortie anticipee sautait la correction.
+        _corriger_canal(conn, child_id)
         return
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?", (child_id,),
@@ -1450,6 +1509,8 @@ def _inherit_notify_subs(
         """,
         (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
     )
+
+    _corriger_canal(conn, child_id)
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -3589,6 +3650,21 @@ def decompose_triage_task(
     return child_ids
 
 
+def _repo_root_from_workspace(root_path: Optional[str], child_id: str) -> Optional[str]:
+    """``<racine du depot du parent>/.worktrees/<child_id>``, ou ``None``.
+
+    Le parent pointe soit sur la racine d'un depot, soit sur un worktree
+    ``<depot>/.worktrees/<id>``. Dans les deux cas la racine se deduit du chemin,
+    sans toucher au disque. ``None`` quand le parent n'a pas de chemin : on
+    retombe alors sur l'ancre du tableau, comportement d'origine.
+    """
+    if not root_path:
+        return None
+    marqueur = "/.worktrees/"
+    racine = root_path.split(marqueur, 1)[0] if marqueur in root_path else root_path.rstrip("/")
+    return f"{racine}/.worktrees/{child_id}" if racine else None
+
+
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
     author: Optional[str], now: int,
@@ -3605,15 +3681,21 @@ def _insert_decomposed_child(
     """
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
+    new_id = _new_task_id()
     if child.get("workspace_path"):
         child_ws_path = child.get("workspace_path")
     elif child_ws_kind == "worktree":
-        child_ws_path = None
+        # Correctif local (15/09/2026) : ancrer sur le DEPOT DU PARENT, pas sur
+        # l'ancre du tableau. Laisser None faisait materialiser le worktree dans
+        # le depot par defaut — sept cartes Ressources/blog ont atterri dans
+        # memlia-desk alors que leur source vivait dans memlia-landing, chacune
+        # bloquant sa chaine. On garde un worktree DISTINCT par enfant (l'isolation
+        # des freres reste entiere) ; seule la racine du depot est heritee.
+        child_ws_path = _repo_root_from_workspace(root_row["workspace_path"], new_id)
     elif child_ws_kind == root_ws_kind:
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
-    new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "

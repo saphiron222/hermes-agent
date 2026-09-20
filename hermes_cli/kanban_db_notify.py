@@ -144,7 +144,10 @@ def add_notify_sub(
             ("user_id_alt", user_id_alt, True),
             # fill_only=False : une colonne au MAUVAIS profil doit etre corrigee,
             # pas seulement une colonne vide (c'est ce qui laissait 97 lignes fausses).
-            ("notifier_profile", notifier_profile, False),
+            # Depot connu → le canal du depot corrige un profil FAUX (fill_only False) ;
+            # depot non liste → semantique upstream : le premier proprietaire garde
+            # (fill_only True), un re-abonnement d un autre profil ne le vole pas.
+            ("notifier_profile", notifier_profile, not _canal),
             ("delivery_mode", valid_mode, False),
             ("delivery_metadata", metadata_json, False),
         ):

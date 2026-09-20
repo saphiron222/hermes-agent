@@ -97,9 +97,17 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
                 (cid,),
             ).fetchone()
             assert row["workspace_kind"] == "worktree"
-            # Each child resolves its own <repo>/.worktrees/<child-id> at
-            # dispatch; the root's literal path must never be shared.
-            assert row["workspace_path"] is None
+            # Memlia (15/09/2026) : le tableau couvre PLUSIEURS depots, l'ancre du
+            # tableau n'est donc pas celle de l'enfant. Chaque enfant recoit son
+            # propre <depot du parent>/.worktrees/<child-id> — jamais le chemin
+            # litteral de la racine (isolation des freres intacte), jamais None
+            # (sept cartes du site avaient ete materialisees dans memlia-desk).
+            assert row["workspace_path"] == f"/repo/.worktrees/{cid}"
+        paths = {
+            conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (cid,)).fetchone()[0]
+            for cid in child_ids
+        }
+        assert len(paths) == len(child_ids), "deux enfants partagent un worktree"
 
 
 

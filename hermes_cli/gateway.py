@@ -4414,6 +4414,12 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    # A restart must also activate the current service contract.  A stale plist can keep
+    # launchd running old lifecycle semantics even when the gateway process imports new code.
+    # The refresh path owns its bootout/bootstrap cycle, so do not start a second restart.
+    if refresh_launchd_plist_if_needed():
+        return
+
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"

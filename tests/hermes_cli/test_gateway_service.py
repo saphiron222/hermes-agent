@@ -1136,6 +1136,23 @@ class TestGatewaySystemServiceRouting:
         assert result is True
         assert "DEGRADED" in capsys.readouterr().out
 
+    def test_launchd_restart_repairs_stale_definition_before_restarting(self, monkeypatch):
+        calls = []
+
+        def unexpected_restart():
+            raise AssertionError("restart continued after the refreshed definition scheduled its reload")
+
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda: calls.append("refresh") or True,
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", unexpected_restart)
+
+        gateway_cli.launchd_restart()
+
+        assert calls == ["refresh"]
+
     def test_launchd_restart_uses_sigusr1_and_exit_wait_budget(self, monkeypatch, capsys):
         """launchd_restart must take the same graceful path as systemd_restart.
 

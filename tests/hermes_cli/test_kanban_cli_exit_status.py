@@ -12,7 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
-def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.CompletedProcess[str]:
+def _run_hermes(
+    home: Path, *args: str, marker: bool = False, cron_session: bool = False,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["HERMES_KANBAN_HOME"] = str(home)
@@ -27,6 +29,10 @@ def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.Comp
         env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
     else:
         env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    if cron_session:
+        env["HERMES_CRON_SESSION"] = "1"
+    else:
+        env.pop("HERMES_CRON_SESSION", None)
     return subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", *args],
         cwd=ROOT,
@@ -58,3 +64,30 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
 
     assert refused.returncode == 1
     assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+
+def test_cron_session_kanban_cli_refusal_preserves_task(tmp_path):
+    """A cron terminal cannot bypass the hidden tool schema via ``hermes kanban``."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "cron sentinel", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    refused = _run_hermes(
+        home,
+        "kanban",
+        "comment",
+        task_id,
+        "must be refused",
+        cron_session=True,
+    )
+
+    assert refused.returncode == 1
+    assert "cron job contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+    shown = _run_hermes(home, "kanban", "show", task_id, "--json")
+    assert shown.returncode == 0, shown.stderr
+    task = json.loads(shown.stdout)
+    assert task["comments"] == []

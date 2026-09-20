@@ -275,13 +275,14 @@ def _finalize_child_env(env: dict) -> dict:
     try:  # strip dispatcher-owned Kanban env from non-owning child subprocesses
         from agent.delegation_context import (
             is_delegated_child_process_context,
+            is_cron_session_context,
             is_dispatcher_owned_worker_context,
             scrub_kanban_env,
             scrub_kanban_identity_env,
         )
         if is_delegated_child_process_context():
             return scrub_kanban_env(env)
-        if not is_dispatcher_owned_worker_context():
+        if is_cron_session_context() or not is_dispatcher_owned_worker_context():
             return scrub_kanban_identity_env(env)
     except Exception:
         pass

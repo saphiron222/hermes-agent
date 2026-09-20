@@ -31,9 +31,11 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -56,6 +58,8 @@ def worker_env(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock-abc")
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "team-alpha")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/kanban.db")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "/tmp/workspaces")
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +496,140 @@ class TestRunJobKanbanIsolation:
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
         }
         assert after == before, "worker identity must survive concurrent cron jobs"
+
+
+def test_registered_direct_cron_run_cannot_mutate_kanban_by_tool_or_cli(
+    tmp_path, monkeypatch, worker_env
+):
+    """Exercise the real ``cronjob_manage(action=run)`` direct path from a worker.
+
+    The cron agent receives no Kanban schema, its terminal child receives none of
+    the seven dispatcher variables, and both a stale tool call and an explicit
+    ``hermes kanban`` shell bypass leave the sentinel untouched.
+    """
+    import cron.scheduler as sched
+    from cron import jobs
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import cronjob_tools, kanban_tools  # noqa: F401 - register real handlers
+    from tools.registry import registry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cron_dir = home / "cron"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(home / "workspaces"))
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(sched, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        sentinel = kb.create_task(conn, title="sentinel", assignee="dev")
+        before_events = len(kb.list_events(conn, sentinel))
+
+    observed: dict = {}
+    parent_env = {
+        key: value for key, value in os.environ.items()
+        if key == "HERMES_HOME" or key.startswith("HERMES_KANBAN_")
+    }
+    root = Path(__file__).parents[2]
+
+    class ProbeAgent:
+        def __init__(self, **kwargs):
+            import model_tools
+
+            tools = model_tools.get_tool_definitions(
+                enabled_toolsets=kwargs.get("enabled_toolsets"), quiet_mode=True
+            )
+            observed["tool_names"] = {
+                item["function"]["name"] for item in tools
+            }
+
+        def run_conversation(self, *_args, **_kwargs):
+            observed["tool_mutation"] = json.loads(
+                registry.dispatch(
+                    "kanban_complete",
+                    {"task_id": sentinel, "summary": "must be refused"},
+                )
+            )
+            try:
+                with kbc.connect_closing() as attachment_conn:
+                    kb.store_attachment_bytes(
+                        attachment_conn, sentinel, "must-not-exist.txt", b"refused",
+                    )
+            except PermissionError as exc:
+                observed["attachment_mutation"] = str(exc)
+            probe = (
+                "import json, os, subprocess, sys; "
+                "print('ENV=' + json.dumps(sorted(k for k in os.environ "
+                "if k.startswith(\"HERMES_KANBAN_\")))); "
+                f"p=subprocess.run([sys.executable, '-m', 'hermes_cli.main', "
+                f"'kanban', 'comment', {sentinel!r}, 'must be refused'], "
+                "capture_output=True, text=True); "
+                "print('RC=' + str(p.returncode)); print('ERR=' + p.stderr.strip())"
+            )
+            from tools.environments.local import LocalEnvironment
+
+            env = LocalEnvironment(cwd=str(root), timeout=30)
+            try:
+                observed["terminal"] = env.execute(
+                    f"{shlex.quote(sys.executable)} -c {shlex.quote(probe)}",
+                    timeout=30,
+                )
+            finally:
+                env.cleanup()
+            return {
+                "final_response": "probe complete",
+                "messages": [{"role": "assistant", "content": "probe complete"}],
+            }
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    fake_run_agent = type(sys)("run_agent")
+    fake_run_agent.AIAgent = ProbeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "test", "api_key": "k",
+            "base_url": "http://test.local", "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(sched, "_build_job_prompt", lambda *_args, **_kwargs: "probe")
+    monkeypatch.setattr(sched, "_resolve_delivery_target", lambda _job: None)
+
+    created = json.loads(registry.dispatch("cronjob_manage", {
+        "action": "create", "name": "isolation probe", "schedule": "1h",
+        "prompt": "Run the isolation probe", "deliver": "local",
+    }))
+    assert created.get("success") is True, created
+    result = json.loads(registry.dispatch(
+        "cronjob_manage", {"action": "run", "job_id": created["job_id"]}
+    ))
+
+    assert result["job"]["execution_success"] is True
+    assert not any(name.startswith("kanban_") for name in observed["tool_names"])
+    assert "does not own" in observed["tool_mutation"]["error"]
+    assert "cron job contexts cannot mutate" in observed["attachment_mutation"]
+    assert not kb.task_attachments_dir(sentinel).exists()
+    terminal_output = observed["terminal"]["output"]
+    assert "ENV=[]" in terminal_output
+    assert "RC=1" in terminal_output
+    assert "cron job contexts cannot mutate Kanban tasks via the CLI" in terminal_output
+    assert {
+        key: value for key, value in os.environ.items()
+        if key == "HERMES_HOME" or key.startswith("HERMES_KANBAN_")
+    } == parent_env
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, sentinel).status == "ready"
+        assert kb.list_comments(conn, sentinel) == []
+        assert len(kb.list_events(conn, sentinel)) == before_events
 
 
 # ---------------------------------------------------------------------------

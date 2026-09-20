@@ -119,18 +119,25 @@ KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools a
 
 
 def _assert_not_delegated_child_mutation() -> None:
-    """Reject Kanban mutations from ``delegate_task`` child contexts.
+    """Reject Kanban mutations from non-owning child and cron contexts.
 
     The tool/CLI fast-fail guards are UX, not a trust boundary (a child can shell
     out or import this module); the invariant lives here so every ``write_txn``
     user and board-metadata mutator fails closed before touching durable state.
     """
     try:
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import (
+            is_cron_session_context,
+            is_delegated_child_process_context,
+        )
 
         delegated = is_delegated_child_process_context()
+        cron_session = is_cron_session_context()
     except Exception:
         delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+        cron_session = bool(os.environ.get("HERMES_CRON_SESSION"))
+    if cron_session:
+        raise PermissionError("cron job contexts cannot mutate Kanban tasks or boards")
     if delegated:
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
@@ -1762,6 +1769,7 @@ def store_attachment_bytes(
     basename, collision-free blob under :func:`task_attachments_dir`, then the
     metadata row. Raises :class:`AttachmentTooLarge` / ``ValueError``; a blob
     whose row insert fails is removed before re-raising. Returns the new id."""
+    _assert_not_delegated_child_mutation()
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
     if len(data) > max_bytes:

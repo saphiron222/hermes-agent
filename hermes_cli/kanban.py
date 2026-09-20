@@ -148,8 +148,8 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
-    if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+    if denial := _cli_mutation_denial(args):
+        return _err(f"kanban: {denial}")
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
@@ -224,19 +224,29 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
 })
 
 
-def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+def _cli_mutation_denial(args: argparse.Namespace) -> Optional[str]:
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
-            return False
+            return None
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
-        return False
+        return None
     try:
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import (
+            is_cron_session_context,
+            is_delegated_child_process_context,
+        )
 
-        return is_delegated_child_process_context()
+        if is_cron_session_context():
+            return "cron job contexts cannot mutate Kanban tasks via the CLI"
+        if is_delegated_child_process_context():
+            return "delegate_task child contexts cannot mutate Kanban tasks via the CLI"
     except Exception:
-        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+        if os.environ.get("HERMES_CRON_SESSION"):
+            return "cron job contexts cannot mutate Kanban tasks via the CLI"
+        if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+            return "delegate_task child contexts cannot mutate Kanban tasks via the CLI"
+    return None
 
 
 def _joined_words(words) -> Optional[str]:

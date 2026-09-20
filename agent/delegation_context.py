@@ -73,6 +73,17 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not (_DELEGATED_CHILD_CONTEXT.get() or _NON_DISPATCHER_OWNED_CONTEXT.get())
 
 
+def is_cron_session_context() -> bool:
+    """True inside a cron agent or a subprocess spawned by one."""
+    try:
+        from gateway.session_context import get_session_env
+
+        value = get_session_env("HERMES_CRON_SESSION", "")
+    except Exception:
+        value = os.environ.get("HERMES_CRON_SESSION", "")
+    return str(value or "").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))

@@ -350,7 +350,11 @@ def test_windows_descendant_spawning_during_cleanup_is_gone_before_requeue(board
 
         assert kbd.detect_crashed_workers(board) == [tid]
         assert kb.get_task(board, tid).status == "ready"
-        assert all(kbd._pid_alive(child_pid) is False for child_pid in child_pids)
+        # ``psutil.pid_exists`` can see a terminated Windows process object while another
+        # handle is still open. WaitForSingleObject answers the invariant we need here:
+        # none of the contained descendants is still executing when the claim is released.
+        from gateway.status import _pid_exists_win32_ctypes
+        assert all(_pid_exists_win32_ctypes(child_pid) is False for child_pid in child_pids)
     finally:
         kbd._live_worker_procs.pop(leader.pid, None)
         job = kbd._live_worker_jobs.pop(leader.pid, None)

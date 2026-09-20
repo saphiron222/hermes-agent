@@ -271,17 +271,60 @@ def test_macos_dead_worker_group_is_gone_before_requeue(board, tmp_path):
     _assert_dead_worker_group_is_gone_before_requeue(board, tmp_path)
 
 
+def test_windows_reclaim_requires_retained_job_extinction(monkeypatch):
+    class ExitedProcess:
+        returncode = 7
+
+        @staticmethod
+        def poll():
+            return 7
+
+    class Job:
+        def __init__(self, extinct):
+            self.extinct = extinct
+            self.calls = 0
+
+        def terminate_and_wait(self, timeout=10):
+            self.calls += 1
+            return self.extinct
+
+    pid = 424_245
+    proc = ExitedProcess()
+    job = Job(extinct=False)
+    monkeypatch.setattr(kbd, "_live_worker_procs", {pid: proc})
+    monkeypatch.setattr(kbd, "_live_worker_jobs", {pid: job})
+    info = {
+        "prev_pid": pid, "host_local": True, "termination_attempted": False,
+        "terminated": False, "sigkill": False,
+    }
+
+    assert kbd._terminate_windows_crashed_worker_tree(pid, "boot|123", info)["terminated"] is False
+    assert job.calls == 1
+    assert pid in kbd._live_worker_procs and pid in kbd._live_worker_jobs
+
+    job.extinct = True
+    info["termination_attempted"] = False
+    assert kbd._terminate_windows_crashed_worker_tree(pid, "boot|123", info)["terminated"] is True
+    assert job.calls == 2
+    assert pid not in kbd._live_worker_procs and pid not in kbd._live_worker_jobs
+    assert kbd._classify_worker_exit(pid) == ("nonzero_exit", 7)
+
+
 @pytest.mark.windows_only
 def test_windows_dead_worker_tree_is_gone_before_requeue(board, tmp_path):
-    child_pid = None
     child_pid_file = tmp_path / "child.pid"
     script = (
         "import pathlib, subprocess, sys; "
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); sys.exit(7)"
     )
-    leader = subprocess.Popen([sys.executable, "-c", script, str(child_pid_file)])
-    kbd._live_worker_procs[leader.pid] = leader
+    leader = kbd._spawn_windows_worker(
+        [sys.executable, "-c", script, str(child_pid_file)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child_pid = None
     try:
         fingerprint = kbd._process_fingerprint(leader.pid)
         assert fingerprint is not None
@@ -294,13 +337,67 @@ def test_windows_dead_worker_tree_is_gone_before_requeue(board, tmp_path):
         tid = _claimed_running(board, pid=leader.pid, started_at=fingerprint)
 
         assert kbd.detect_crashed_workers(board) == [tid]
-        assert kb.get_task(board, tid).status == "ready"
-        assert kbd._pid_alive(child_pid) is False
+        task = kb.get_task(board, tid)
+        assert task is not None and task.status == "ready"
+        from gateway.status import _pid_exists_win32_ctypes
+        assert _pid_exists_win32_ctypes(child_pid) is False
     finally:
         kbd._live_worker_procs.pop(leader.pid, None)
-        if child_pid is not None:
-            with __import__("contextlib").suppress(Exception):
-                __import__("psutil").Process(child_pid).kill()
+        job = kbd._live_worker_jobs.pop(leader.pid, None)
+        if job is not None:
+            job.terminate_and_wait()
+
+
+@pytest.mark.windows_only
+def test_windows_descendant_spawning_during_cleanup_is_gone_before_requeue(board, tmp_path):
+    """The Job contains descendants atomically, even while one is still spawning children."""
+    child_pids_file = tmp_path / "children.txt"
+    spawner = tmp_path / "spawner.py"
+    spawner.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "while True:\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "    with p.open('a') as stream:\n"
+        "        stream.write(str(child.pid) + '\\n')\n"
+        "    time.sleep(.01)\n"
+    )
+    leader_script = tmp_path / "leader.py"
+    leader_script.write_text(
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+        "sys.exit(7)\n"
+    )
+    leader = kbd._spawn_windows_worker(
+        [sys.executable, str(leader_script), str(spawner), str(child_pids_file)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        fingerprint = kbd._process_fingerprint(leader.pid)
+        assert fingerprint is not None
+        deadline = time.monotonic() + 5
+        while (not child_pids_file.exists() or len(child_pids_file.read_text().splitlines()) < 2) \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pids = [int(value) for value in child_pids_file.read_text().splitlines()]
+        assert len(child_pids) >= 2
+        leader.wait(timeout=5)
+        tid = _claimed_running(board, pid=leader.pid, started_at=fingerprint)
+
+        assert kbd.detect_crashed_workers(board) == [tid]
+        assert kb.get_task(board, tid).status == "ready"
+        # ``psutil.pid_exists`` can see a terminated Windows process object while another
+        # handle is still open. WaitForSingleObject answers the invariant we need here:
+        # none of the contained descendants is still executing when the claim is released.
+        from gateway.status import _pid_exists_win32_ctypes
+        assert all(_pid_exists_win32_ctypes(child_pid) is False for child_pid in child_pids)
+    finally:
+        kbd._live_worker_procs.pop(leader.pid, None)
+        job = kbd._live_worker_jobs.pop(leader.pid, None)
+        if job is not None:
+            job.terminate_and_wait()
 
 
 def test_crash_reclaim_holds_claim_when_worker_group_cannot_be_proven_gone(board, monkeypatch):

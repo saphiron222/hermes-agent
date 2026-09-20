@@ -61,6 +61,9 @@ jobs:
             tests/hermes_cli/test_taskkill_identity_windows_live.py \
             tests/hermes_cli/test_git_trampoline_windows_live.py \
             tests/hermes_cli/test_managed_uv_windows_cutover.py \
+            tests/hermes_cli/test_local_runtime_processes.py \
+            tests/hermes_cli/test_kanban_worker_exit_decode.py \
+            tests/hermes_cli/test_kanban_worker_pid_fingerprint.py \
             -o addopts= -v -p no:cacheprovider
 
       - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)

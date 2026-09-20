@@ -33,7 +33,13 @@ def test_windows_reaper_classifies_parked_popen_exit(monkeypatch):
     for name in ("WIFEXITED", "WEXITSTATUS", "WIFSIGNALED", "WTERMSIG"):
         monkeypatch.delattr(os, name, raising=False)
     monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_live_worker_jobs", {})
     monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+
+    class ExtinctJob:
+        @staticmethod
+        def terminate_and_wait():
+            return True
 
     limited = _spawn_exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
     crashed = _spawn_exit(3)
@@ -41,6 +47,7 @@ def test_windows_reaper_classifies_parked_popen_exit(monkeypatch):
     try:
         for proc in (limited, crashed, alive):
             kbd._live_worker_procs[proc.pid] = proc
+            kbd._live_worker_jobs[proc.pid] = ExtinctJob()
 
         reaped = kbd.reap_worker_zombies()
 
@@ -60,9 +67,12 @@ def test_native_windows_reaper_and_decode(monkeypatch):
     reaper and the decode runs where ``os.WIFEXITED`` does not exist, so the
     rate-limit sentinel exit is a requeue, not a crash."""
     monkeypatch.setattr(kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(kbd, "_live_worker_jobs", {})
     monkeypatch.setattr(kbd, "_recent_worker_exits", {})
     assert not hasattr(os, "WIFEXITED")
-    proc = _spawn_exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-    kbd._live_worker_procs[proc.pid] = proc
+    proc = kbd._spawn_windows_worker(
+        [sys.executable, "-c", f"raise SystemExit({kb.KANBAN_RATE_LIMIT_EXIT_CODE})"],
+    )
+    proc.wait()
     assert kbd.reap_worker_zombies() == [proc.pid]
     assert kbd._classify_worker_exit(proc.pid) == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)

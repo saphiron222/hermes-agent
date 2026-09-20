@@ -523,6 +523,33 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         ).fetchone()[0] == 1
 
 
+def test_uncertain_windows_spawn_cleanup_never_charges_the_card(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    from hermes_cli.local_runtime.processes import WindowsSpawnCleanupPending
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+
+    def cleanup_pending(task, workspace, board=None):
+        raise WindowsSpawnCleanupPending('injected cleanup uncertainty')
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cleanup pending", assignee="a")
+        result = kbd.dispatch_once(conn, spawn_fn=cleanup_pending, failure_limit=1)
+
+        assert result.auto_blocked == []
+        row = conn.execute(
+            "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert (row["status"], row["consecutive_failures"]) == ("ready", 0)
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ?", (tid,),
+        ).fetchone()
+        assert run["outcome"] == "spawn_failed"
+        assert json.loads(run["metadata"])["infrastructure"] is True
+        assert kbd.check_respawn_guard(conn, tid) == "infrastructure_cooldown"
+
+
 
 
 

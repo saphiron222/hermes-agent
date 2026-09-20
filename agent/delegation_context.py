@@ -16,6 +16,7 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
+_NON_DISPATCHER_KANBAN_FENCE: ContextVar[str] = ContextVar("hermes_non_dispatcher_kanban_fence", default="")
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
@@ -23,6 +24,23 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
+
+
+def _non_dispatcher_fenced_root() -> str:
+    """Capture the worker's board root without importing Kanban modules.
+
+    Entering a cron run must be side-effect free: importing ``kanban_db`` here can
+    trigger plugin discovery before the job starts. Dispatcher workers always pin
+    their DB; its parent is the scoped board directory (or the shared root for the
+    default board). ``"1"`` fails closed for legacy/unpinned callers.
+    """
+    if home := (os.environ.get("HERMES_KANBAN_HOME") or "").strip():
+        return home
+    if db := (os.environ.get("HERMES_KANBAN_DB") or "").strip():
+        from pathlib import Path
+
+        return str(Path(db).expanduser().resolve().parent)
+    return "1"
 
 
 @contextmanager
@@ -45,14 +63,23 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
-def enter_non_dispatcher_owned_context() -> Token[bool]:
-    """Token form of :func:`non_dispatcher_owned_context` for long try/finally scopes."""
-    return _NON_DISPATCHER_OWNED_CONTEXT.set(True)
+def enter_non_dispatcher_owned_context() -> tuple[Token[bool], Token[str]]:
+    """Token form of :func:`non_dispatcher_owned_context` for long try/finally scopes.
+
+    Capture the parent's board root now so the path fence remains scoped if the
+    cron run later points ``HERMES_HOME`` at an unrelated scratch board.
+    """
+    ownership_token = _NON_DISPATCHER_OWNED_CONTEXT.set(True)
+    fence_root = _non_dispatcher_fenced_root() if os.environ.get("HERMES_KANBAN_TASK") else ""
+    fence_token = _NON_DISPATCHER_KANBAN_FENCE.set(fence_root)
+    return ownership_token, fence_token
 
 
-def exit_non_dispatcher_owned_context(token: Token[bool]) -> None:
-    """Restore the flag saved by :func:`enter_non_dispatcher_owned_context`."""
-    _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
+def exit_non_dispatcher_owned_context(token: tuple[Token[bool], Token[str]]) -> None:
+    """Restore the scope saved by :func:`enter_non_dispatcher_owned_context`."""
+    ownership_token, fence_token = token
+    _NON_DISPATCHER_KANBAN_FENCE.reset(fence_token)
+    _NON_DISPATCHER_OWNED_CONTEXT.reset(ownership_token)
 
 
 @contextmanager
@@ -120,12 +147,13 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
 
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:
     """Whether Kanban mutations at *path* (a board DB or board-metadata root) are denied for this
-    process: always for an in-process delegate child (the parent's own board); for a spawned
-    descendant only when *path* is the dispatcher-pinned ``HERMES_KANBAN_DB`` or lies under the
-    fenced root the marker carries. A legacy ``"1"`` marker fences everything."""
+    process: always for an in-process delegate child or non-dispatcher cron run (the parent's own
+    board); for a spawned descendant only when *path* is the dispatcher-pinned
+    ``HERMES_KANBAN_DB`` or lies under the fenced root the marker carries. A legacy ``"1"`` marker
+    fences everything."""
     if _DELEGATED_CHILD_CONTEXT.get():
         return True
-    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "")
+    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "") or _NON_DISPATCHER_KANBAN_FENCE.get()
     if not marker:
         return False
     if marker == "1":

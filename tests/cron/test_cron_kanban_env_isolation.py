@@ -12,8 +12,8 @@ system prompt, and ``kanban_complete`` defaults ``task_id`` to
 ``$HERMES_KANBAN_TASK`` — letting an unrelated cron job close the worker's task
 and overwrite real results.
 
-The isolation is a **ContextVar**, deliberately not an ``os.environ`` clear:
-``os.environ`` is process-global and shared with
+The in-process boundary is a **ContextVar**, deliberately not an
+``os.environ`` clear: ``os.environ`` is process-global and shared with
 
   * the worker's own claim heartbeat (``run_agent._touch_activity`` ->
     ``heartbeat_current_worker_from_env``), which would starve and let the
@@ -22,8 +22,11 @@ The isolation is a **ContextVar**, deliberately not an ``os.environ`` clear:
   * concurrent cron jobs on the parallel pool, which take a *shared* read lock
     and can interleave one another's snapshot/restore.
 
-So these tests assert both that the identity is hidden AND that the environment
-is left completely untouched.
+Real descendants use the upstream path fence instead: worker identity keys are
+removed, board-location keys remain available for reads, and
+``HERMES_DELEGATED_CHILD_CONTEXT`` carries the board root whose writes are
+denied.  These tests assert the property (no inherited mutation authority), not
+the obsolete implementation detail that every ``HERMES_KANBAN_*`` key vanishes.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -159,26 +163,56 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_tools._check_kanban_mode() is False
 
-    def test_task_tools_stay_hidden_when_profile_enables_kanban(
-        self, monkeypatch, worker_env
+    def test_profile_opt_in_keeps_schema_but_fences_parent_board(
+        self, monkeypatch, worker_env, tmp_path
     ):
-        """A profile opt-in must not restore the inherited worker authority."""
-        from agent.delegation_context import non_dispatcher_owned_context
+        """Schema visibility is not authority: the parent board stays fenced."""
+        from agent.delegation_context import (
+            kanban_path_is_fenced,
+            non_dispatcher_owned_context,
+        )
         from tools import kanban_tools
 
+        parent_home = tmp_path / "parent-home"
+        parent_home.mkdir()
+        parent_db = parent_home / "kanban.db"
+        scratch_db = tmp_path / "scratch" / "kanban.db"
+        monkeypatch.setenv("HERMES_HOME", str(parent_home))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(parent_db))
         monkeypatch.setattr(kanban_tools, "_profile_has_kanban_toolset", lambda: True)
         with non_dispatcher_owned_context():
-            assert kanban_tools._check_kanban_mode() is False
-            assert kanban_tools._check_kanban_orchestrator_mode() is False
+            assert kanban_tools._check_kanban_mode() is True
+            assert kanban_path_is_fenced(parent_db) is True
+            assert kanban_path_is_fenced(scratch_db) is False
 
-    def test_cached_worker_tool_verdict_does_not_leak_into_cron(self, worker_env):
-        """The registry's process-wide check_fn cache must not restore the tools."""
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        with non_dispatcher_owned_context():
+            assert kanban_path_is_fenced(parent_db) is False
+
+    def test_cached_worker_tool_schema_cannot_mutate_from_cron(
+        self, monkeypatch, worker_env, tmp_path
+    ):
+        """Even a stale/explicit schema cannot turn cron into the parent worker."""
         from types import SimpleNamespace
 
         from agent.delegation_context import non_dispatcher_owned_context
         from agent.agent_init import _load_tools
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
         import model_tools
+        from tools import kanban_tools
         from tools.registry import invalidate_check_fn_cache
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title="parent", assignee="worker")
+            comments_before = kb.list_comments(conn, tid)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
 
         invalidate_check_fn_cache()
         model_tools._tool_defs_cache.clear()
@@ -195,10 +229,17 @@ class TestKanbanGatesRespectContext:
             )
             cron_agent = SimpleNamespace(quiet_mode=True)
             _load_tools(cron_agent, ["kanban"], [])
+            mutation = json.loads(kanban_tools._handle_comment({
+                "task_id": tid,
+                "body": "must not land",
+            }))
 
         cron_names = {tool["function"]["name"] for tool in cron_tools}
-        assert not any(name.startswith("kanban_") for name in cron_names)
+        assert "kanban_comment" in cron_names
         assert cron_agent._kanban_worker_guidance == ""
+        assert mutation.get("error")
+        with kbc.connect() as conn:
+            assert kb.list_comments(conn, tid) == comments_before
 
     def test_stop_nudge_hidden_from_cron_agent(self, worker_env):
         from agent.delegation_context import non_dispatcher_owned_context
@@ -208,37 +249,57 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_stop_nudge_enabled() is False
 
-    def test_explicit_mutation_rejected_from_cron_agent(self, worker_env):
-        """A stale schema or explicit task id cannot recover the parent's authority."""
+    def test_kanban_db_api_mutation_rejected_from_cron_agent(
+        self, monkeypatch, worker_env, tmp_path
+    ):
+        """The Kanban DB API fence, not only the tool wrapper, preserves the parent."""
         from agent.delegation_context import non_dispatcher_owned_context
-        from tools import kanban_tools
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
-        with non_dispatcher_owned_context(), pytest.raises(kanban_tools._Reject):
-            kanban_tools._worker_guard(
-                "kanban_complete", {"task_id": "t_worker_real_task"}
-            )
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title="parent", assignee="worker")
+            before = kb.list_comments(conn, tid)
+            with non_dispatcher_owned_context(), pytest.raises(PermissionError):
+                kb.add_comment(conn, tid, author="cron", body="must not land")
+            assert kb.list_comments(conn, tid) == before
 
-    def test_cron_child_env_scrubs_kanban_identity_but_keeps_profile(
+    def test_cron_child_env_carries_fence_and_drops_worker_identity(
         self, worker_env
     ):
-        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER,
+            KANBAN_ENV_KEYS,
+            non_dispatcher_owned_context,
+        )
         from tools.environments.local import build_subprocess_env
 
         base = dict(os.environ)
         base["HERMES_HOME"] = "/tmp/profile-home"
+        base["HERMES_KANBAN_DB"] = "/tmp/profile-home/kanban.db"
         with non_dispatcher_owned_context():
             child_env = build_subprocess_env(base=base)
 
-        assert not any(key.startswith("HERMES_KANBAN_") for key in child_env)
+        assert not (set(KANBAN_ENV_KEYS) & child_env.keys())
         assert child_env["HERMES_HOME"] == "/tmp/profile-home"
+        assert child_env["HERMES_KANBAN_DB"] == "/tmp/profile-home/kanban.db"
+        assert child_env[DELEGATED_CHILD_ENV_MARKER]
 
-    def test_no_scrub_cron_child_drops_all_kanban_vars_only(
+    def test_no_scrub_child_process_carries_effective_parent_board_fence(
         self, monkeypatch, worker_env
     ):
-        """The mono-profile external worker uses the no-scrub factory path."""
+        """The no-secret-scrub spawn still drops identity and enforces the path fence."""
+        from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
         from tools.environments.local import build_subprocess_env
 
         monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/profile-home/kanban.db")
         monkeypatch.setenv("HERMES_KANBAN_FUTURE_CAPABILITY", "must-not-leak")
         monkeypatch.setenv("CRON_NO_SCRUB_SENTINEL", "must-survive")
         parent_before = dict(os.environ)
@@ -250,13 +311,18 @@ class TestKanbanGatesRespectContext:
                 "-c",
                 (
                     "import json, os; "
+                    "from agent.delegation_context import KANBAN_ENV_KEYS, kanban_path_is_fenced; "
                     "print(json.dumps({"
-                    "'kanban': sorted(k for k in os.environ if k.startswith('HERMES_KANBAN_')), "
+                    "'identity': sorted(k for k in KANBAN_ENV_KEYS if k in os.environ), "
+                    "'db': os.environ.get('HERMES_KANBAN_DB'), "
+                    "'marker': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT'), "
+                    "'fenced': kanban_path_is_fenced(os.environ['HERMES_KANBAN_DB']), "
                     "'home': os.environ.get('HERMES_HOME'), "
                     "'sentinel': os.environ.get('CRON_NO_SCRUB_SENTINEL')}))"
                 ),
             ],
             env=child_env,
+            cwd=str(Path(__file__).resolve().parents[2]),
             check=True,
             capture_output=True,
             text=True,
@@ -264,10 +330,14 @@ class TestKanbanGatesRespectContext:
         observed = json.loads(probe.stdout)
 
         assert observed == {
-            "kanban": [],
+            "identity": [],
+            "db": "/tmp/profile-home/kanban.db",
+            "marker": child_env[DELEGATED_CHILD_ENV_MARKER],
+            "fenced": True,
             "home": "/tmp/profile-home",
             "sentinel": "must-survive",
         }
+        assert not (set(KANBAN_ENV_KEYS) & child_env.keys())
         assert dict(os.environ) == parent_before
 
     def test_complete_does_not_default_to_worker_task(self, worker_env):

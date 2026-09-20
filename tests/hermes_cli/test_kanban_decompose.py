@@ -57,22 +57,35 @@ def _patch_extra_body():
     return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
-def _patch_list_profiles(names: list[str]):
+def _patch_list_profiles(names: list[str], *, unavailable: set[str] | None = None):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
     profiles_mod.profile_exists() to resolve orchestrator/default."""
     from types import SimpleNamespace
+    unavailable = unavailable or set()
     fake_profiles = [
         SimpleNamespace(
             name=n, is_default=(i == 0), description=f"desc for {n}",
             description_auto=False, model="m", provider="p", skill_count=1,
+            path=Path(f"/profiles/{n}"), gateway_running=True,
         )
         for i, n in enumerate(names)
     ]
+    availability = {
+        p.name: SimpleNamespace(
+            available=p.name not in unavailable,
+            reason=(f"profile {p.name!r} has no usable credentials" if p.name in unavailable else ""),
+        )
+        for p in fake_profiles
+    }
     return [
         patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch(
+            "hermes_cli.profile_availability.profile_worker_availability",
+            side_effect=lambda p, **_kwargs: availability[p.name],
+        ),
     ]
 
 
@@ -112,6 +125,47 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+
+
+def test_decompose_refuses_unavailable_profile_and_keeps_healthy_choice(kanban_home):
+    """The LLM cannot route to a profile omitted for missing credentials, even
+    if it returns that stale profile name anyway; a healthy roster choice still
+    passes unchanged."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="healthy", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "exercise stale routing",
+        "tasks": [
+            {"title": "stale", "body": "must fall back", "assignee": "dead", "parents": []},
+            {"title": "healthy", "body": "must stay", "assignee": "healthy", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["healthy", "dead"], unavailable={"dead"})
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=_fake_aux_response(llm_payload),
+        ) as call_llm, _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
+    assert [child.assignee for child in children] == ["healthy", "healthy"]
+    prompt = call_llm.call_args.kwargs["messages"][-1]["content"]
+    assert "healthy" in prompt
+    assert "dead" not in prompt
 
 
 def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_home):

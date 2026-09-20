@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import profile_availability
 from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
@@ -126,7 +127,13 @@ def _profile_author() -> str:
     return _specify_author("decomposer")
 
 
-def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
+def _resolve_profile_from_cfg(
+    cfg: dict,
+    key: str,
+    *,
+    fallback: Optional[str] = None,
+    available_names: Optional[set[str]] = None,
+) -> str:
     """``kanban.<key>`` if it names an existing profile, else ``fallback``
     (the root task's own assignee) if that does, else the active default
     profile — so a task is never stranded for lack of an owner.
@@ -143,14 +150,21 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     for candidate in (explicit, (fallback or "").strip()):
         if candidate:
             try:
-                if profiles_mod.profile_exists(candidate):
+                if (
+                    candidate in available_names
+                    if available_names is not None
+                    else profiles_mod.profile_exists(candidate)
+                ):
                     return candidate
             except Exception:
                 pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if available_names is None or active in available_names:
+        return active
+    return sorted(available_names)[0] if available_names else "default"
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -163,13 +177,17 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         return [], set()
     roster = []
     for p in all_profiles:
+        availability = profile_availability.profile_worker_availability(p)
+        if not availability.available:
+            logger.info("decompose: excluding unavailable profile %r: %s", p.name, availability.reason)
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-    return roster, {p.name for p in all_profiles}
+    return roster, {entry["name"] for entry in roster}
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -210,8 +228,12 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     roster, valid_names = _build_roster()
     return _Routing(
-        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
-        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
+        orchestrator=_resolve_profile_from_cfg(
+            cfg, "orchestrator_profile", fallback=root_assignee, available_names=valid_names,
+        ),
+        default_assignee=_resolve_profile_from_cfg(
+            cfg, "default_assignee", fallback=root_assignee, available_names=valid_names,
+        ),
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
@@ -314,6 +336,12 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, reason)
 
     routing = _load_routing(root_assignee=task.assignee)
+    if not routing.valid_names:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "no available profiles: every installed profile is stopped, unconfigured, or unauthenticated",
+        )
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(

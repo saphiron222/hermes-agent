@@ -2041,6 +2041,23 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if spawn_fn is None:
+        # A profile directory only proves that the assignee exists.  Before the
+        # real Hermes spawner runs, measure the profile's live gateway and its
+        # profile-scoped provider credentials.  Custom spawners own their own
+        # readiness contract and therefore bypass this Hermes-specific guard.
+        from hermes_cli.profile_availability import worker_availability_for_name
+
+        availability = worker_availability_for_name(
+            claimed.assignee or assignee,
+            provider_override=claimed.provider_override,
+            model_override=claimed.model_override,
+        )
+        if not availability.available:
+            reason = f"assignee unavailable: {availability.reason}"
+            if _kb.block_task(conn, claimed.id, reason=reason, kind="capability"):
+                result.auto_blocked.append(claimed.id)
+            return False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":

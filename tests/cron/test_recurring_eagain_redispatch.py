@@ -24,6 +24,7 @@ This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -73,34 +74,33 @@ def wedge_env(tmp_path, monkeypatch):
 
 class TestEAGAINRecurringRedispatches:
     def _make_script_eagain(self, env, monkeypatch):
-        """Make the next subprocess.Popen raise EAGAIN once, then pass.
+        """Make the next cron script spawn raise EAGAIN once, then pass.
 
         The script runner spawns via Popen (polling loop for cancel/timeout),
-        so the substrate-failure injection point is the Popen constructor.
+        so the substrate-failure injection point is its module-local subprocess
+        binding. Patching the stdlib module's Popen would also intercept unrelated
+        Git discovery commands issued during the tick.
         """
-        import cron.scheduler as sched_mod
+        import cron.scheduler_script as script_mod
         state = {"n": 0}
-
-        class _OkProc:
-            def __init__(self, argv, **kwargs):
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
-            def wait(self, timeout=None):
-                return 0
+        real_popen = subprocess.Popen
+        script_path = str(env["home"] / "scripts" / "probe.py")
 
         def fake_popen(argv, **kwargs):
-            state["n"] += 1
-            if state["n"] == 1:
-                raise OSError(11, "Resource temporarily unavailable")
-            return _OkProc(argv, **kwargs)
+            if script_path in map(str, argv):
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real_popen(argv, **kwargs)
 
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        class _ScriptSubprocessProxy:
+            def __init__(self):
+                self.Popen = fake_popen
+
+            def __getattr__(self, name):
+                return getattr(subprocess, name)
+
+        monkeypatch.setattr(script_mod, "subprocess", _ScriptSubprocessProxy())
         return state
 
     def test_eagain_then_redispatched_on_next_tick(self, wedge_env, monkeypatch, tmp_path):
@@ -115,6 +115,16 @@ class TestEAGAINRecurringRedispatches:
         monkeypatch.setattr(S, "get_due_jobs", S.get_due_jobs)  # no-op, keep real
 
         state = self._make_script_eagain(env, monkeypatch)
+
+        # Import-time/worktree discovery may spawn Git before the cron script.
+        # That unrelated process must not consume the one-shot EAGAIN injection.
+        subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=Path(__file__).parent.parent.parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         # Tick 1: EAGAIN failure.
         n1 = S.tick(verbose=False, sync=True)

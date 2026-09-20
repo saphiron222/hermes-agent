@@ -704,6 +704,10 @@ def _provider_has_credentials(pid: str) -> bool:
 
         if pid == "custom":
             return bool((_get_custom_base_url() or "").strip())
+        if pid.startswith("custom:"):
+            from hermes_cli.runtime_provider_custom import _resolve_named_custom_runtime
+
+            return _resolve_named_custom_runtime(requested_provider=pid) is not None
         if pid == "openrouter":
             from hermes_cli.model_switch import _scoped_key_env
             return has_usable_secret(_scoped_key_env("OPENROUTER_API_KEY"))

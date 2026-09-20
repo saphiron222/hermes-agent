@@ -76,14 +76,131 @@ def test_profile_worker_availability_requires_auth_and_preserves_healthy_profile
     )
     from hermes_cli import models
 
+    profile.provider = ""
+    assert "no provider configured" in profile_availability.profile_worker_availability(profile).reason
+    profile.provider = "openai-codex"
+    profile.model = ""
+    assert "no model configured" in profile_availability.profile_worker_availability(profile).reason
+
     monkeypatch.setattr(models, "_provider_has_credentials", lambda _provider: False)
-    unavailable = profile_availability.profile_worker_availability(profile)
+    unavailable = profile_availability.profile_worker_availability(
+        profile,
+        provider_override="openai-codex",
+        model_override="gpt-5.6-sol",
+    )
     assert unavailable.available is False
     assert "no usable credentials" in unavailable.reason
 
     monkeypatch.setattr(models, "_provider_has_credentials", lambda _provider: True)
+    profile.model = "gpt-5.6-sol"
     available = profile_availability.profile_worker_availability(profile)
     assert available == profile_availability.ProfileWorkerAvailability(True)
+
+
+def test_profile_worker_availability_accepts_configured_named_custom_provider(
+    kanban_home, monkeypatch,
+):
+    profile_home = kanban_home / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom:my-gateway\n"
+        "  default: gpt-5.4\n"
+        "providers:\n"
+        "  my-gateway:\n"
+        "    base_url: https://gateway.example.com/v1\n"
+        "    api_key: test-key\n",
+        encoding="utf-8",
+    )
+    profile = ProfileInfo(
+        name="worker",
+        path=profile_home,
+        is_default=False,
+        gateway_running=True,
+        provider="custom:my-gateway",
+        model="gpt-5.4",
+    )
+    from hermes_cli import auth
+
+    monkeypatch.setattr(
+        auth,
+        "get_auth_status",
+        lambda provider: pytest.fail(f"named custom provider reached auth registry: {provider}"),
+    )
+
+    assert profile_availability.profile_worker_availability(profile) == (
+        profile_availability.ProfileWorkerAvailability(True)
+    )
+
+    from hermes_cli import kanban_decompose, profiles
+
+    monkeypatch.setattr(profiles, "list_profiles", lambda **_kwargs: [profile])
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "worker")
+    roster, valid_names = kanban_decompose._build_roster()
+    assert [entry["name"] for entry in roster] == ["worker"]
+    assert valid_names == {"worker"}
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="custom route", assignee="worker")
+        monkeypatch.setattr(kbd, "_default_spawn", lambda *_args, **_kwargs: 0)
+        result = kbd.dispatch_once(conn)
+        dispatched = kb.get_task(conn, task_id)
+    assert [row[0] for row in result.spawned] == [task_id]
+    assert dispatched is not None
+    assert dispatched.status == "running"
+
+    profile.provider = "custom:missing"
+    unavailable = profile_availability.profile_worker_availability(profile)
+    assert unavailable.available is False
+    assert "no usable credentials" in unavailable.reason
+
+
+@pytest.mark.parametrize("auth_error", [None, RuntimeError("auth failed")])
+def test_profile_worker_availability_restores_a_after_reading_b(
+    tmp_path, monkeypatch, auth_error,
+):
+    from agent.secret_scope import current_secret_scope, get_secret, reset_secret_scope, set_secret_scope
+    from hermes_constants import (
+        get_hermes_home_override,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from hermes_cli import models
+
+    home_a = tmp_path / "profiles" / "a"
+    home_b = tmp_path / "profiles" / "b"
+    home_a.mkdir(parents=True)
+    home_b.mkdir(parents=True)
+    (home_b / ".env").write_text("PROFILE_KEY=from-b\n", encoding="utf-8")
+    profile = ProfileInfo(
+        name="b",
+        path=home_b,
+        is_default=False,
+        gateway_running=True,
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+    )
+    scope_a = {"PROFILE_KEY": "from-a"}
+    home_token = set_hermes_home_override(home_a)
+    secret_token = set_secret_scope(scope_a)
+
+    def inspect_b(_provider):
+        assert get_hermes_home_override() == str(home_b)
+        assert get_secret("PROFILE_KEY") == "from-b"
+        if auth_error is not None:
+            raise auth_error
+        return True
+
+    monkeypatch.setattr(models, "_provider_has_credentials", inspect_b)
+    try:
+        verdict = profile_availability.profile_worker_availability(profile)
+        assert verdict.available is (auth_error is None)
+        assert get_hermes_home_override() == str(home_a)
+        assert current_secret_scope() is scope_a
+        assert get_secret("PROFILE_KEY") == "from-a"
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
 
 
 def test_profile_worker_availability_refuses_stopped_gateway(tmp_path, monkeypatch):

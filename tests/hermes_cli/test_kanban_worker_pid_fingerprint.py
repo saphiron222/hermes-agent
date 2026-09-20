@@ -60,9 +60,9 @@ def test_recycled_pid_is_reclaimed_without_being_signalled(board):
     assert kb.get_task(conn, tid2).status == "ready"
 
 
-def test_matching_fingerprint_keeps_the_live_worker(board):
+def test_matching_fingerprint_keeps_the_live_worker_and_never_signals_caller(board):
     """The same PID with ITS OWN fingerprint (recorded at spawn) is our worker: the expired claim is
-    extended rather than reclaimed, and the timeout path signals it."""
+    extended rather than reclaimed, and cleanup cannot signal its own caller process."""
     from gateway.status import get_process_start_time
 
     conn = board
@@ -76,8 +76,76 @@ def test_matching_fingerprint_keeps_the_live_worker(board):
 
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (tid,))
-    kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
-    assert killed and killed[0] == (os.getpid(), signal.SIGTERM)
+    assert kbd.enforce_max_runtime(
+        conn, signal_fn=lambda pid, sig: killed.append((pid, sig))
+    ) == []
+    assert killed == []
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "running"
+
+
+def test_transient_fingerprint_probe_failure_holds_live_worker_claim(board, monkeypatch):
+    """A temporary /proc/ps read failure is unknown, not proof that a verified worker died.
+
+    Releasing the claim on that ambiguity starts a retry in the same workspace while the first
+    worker still writes there.  The liveness and termination paths must both fail closed.
+    """
+    conn = board
+    fingerprint = kbd._process_fingerprint(os.getpid())
+    assert fingerprint is not None
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=fingerprint)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+    killed = []
+
+    assert kbd._worker_alive(os.getpid(), fingerprint) is True
+    assert kbd.detect_crashed_workers(conn) == []
+    assert kb.release_stale_claims(
+        conn, signal_fn=lambda pid, sig: killed.append((pid, sig))
+    ) == 0
+    assert killed == []
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "running"
+
+
+@pytest.mark.macos_only
+def test_macos_ps_probe_failure_does_not_override_primary_pid_liveness(monkeypatch):
+    """The optional zombie probe cannot turn a proven-live PID into a crash."""
+    import gateway.status as status
+
+    class FailedPsProbe:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(kbd.subprocess, "run", lambda *_args, **_kwargs: FailedPsProbe())
+
+    assert kbd._pid_alive(424_242) is True
+
+
+def test_max_runtime_holds_claim_until_verified_worker_really_exits(board, monkeypatch):
+    """TERM/KILL delivery is not termination: a surviving worker keeps its workspace claim."""
+    conn = board
+    pid = 424_242
+    fingerprint = "boot-a|123"
+    tid = _claimed_running(conn, pid=pid, started_at=fingerprint, max_runtime=1)
+    killed = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda candidate: candidate == pid)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda candidate: fingerprint)
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *_args, **_kwargs: False)
+
+    assert kbd.enforce_max_runtime(
+        conn, signal_fn=lambda candidate, sig: killed.append((candidate, sig))
+    ) == []
+    assert killed == [(pid, signal.SIGTERM), (pid, getattr(signal, "SIGKILL", signal.SIGTERM))]
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.worker_pid == pid
+    assert any(
+        event.kind == "reclaim_deferred"
+        and event.payload["reason"] == "max_runtime_worker_alive"
+        for event in kb.list_events(conn, tid)
+    )
 
 
 def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
@@ -141,11 +209,12 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert killed == []
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
+    dead_pid = 424_243
     tid2 = kb.create_task(conn, title="job2", assignee="worker")
     kb.claim_task(conn, tid2)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_expires = ? WHERE id = ?",
-                     (os.getpid(), kbd.UNVERIFIED_WORKER_FINGERPRINT, old, tid2))
+                     (dead_pid, kbd.UNVERIFIED_WORKER_FINGERPRINT, old, tid2))
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"

@@ -262,60 +262,60 @@ def test_read_worker_log_tail(kanban_home):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
-def test_max_runtime_terminates_overrun_worker(kanban_home):
+def test_max_runtime_terminates_overrun_worker(kanban_home, monkeypatch):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
+    # Use a non-caller PID: cleanup must never be able to signal its own process.
     import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    worker_pid = 999_991
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)  # SIGTERM worked immediately
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: "boot|123")
 
+    conn = kbc.connect()
     try:
-        conn = kbc.connect()
-        try:
-            tid = kb.create_task(
-                conn, title="long job", assignee="worker",
-                max_runtime_seconds=1,  # one second cap
+        tid = kb.create_task(
+            conn, title="long job", assignee="worker",
+            max_runtime_seconds=1,  # one second cap
+        )
+        # Spawn by hand: claim + set pid + set active run start to the past.
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, worker_pid)
+        # Backdate both the task-level first-start timestamp and the active
+        # run timestamp so elapsed > limit under the per-run runtime model.
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (old_started, tid),
             )
-            # Spawn by hand: claim + set pid + set active run start to the past.
-            kb.claim_task(conn, tid)
-            kbd._set_worker_pid(conn, tid, os.getpid())   # any live pid works
-            # Backdate both the task-level first-start timestamp and the active
-            # run timestamp so elapsed > limit under the per-run runtime model.
-            old_started = int(time.time()) - 30
-            with kb.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET started_at = ? WHERE id = ?",
-                    (old_started, tid),
-                )
-                conn.execute(
-                    "UPDATE task_runs SET started_at = ? "
-                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                    (old_started, tid),
-                )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
 
-            timed_out = kbd.enforce_max_runtime(conn, signal_fn=_signal_fn)
-            assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+        timed_out = kbd.enforce_max_runtime(conn, signal_fn=_signal_fn)
+        assert tid in timed_out
+        assert killed and killed[0][0] == worker_pid
 
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
-            assert task.worker_pid is None
-            assert task.last_heartbeat_at is None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready", f"timed-out task should reset to ready, got {task.status}"
+        assert task.worker_pid is None
+        assert task.last_heartbeat_at is None
 
-            events = kb.list_events(conn, tid)
-            assert any(e.kind == "timed_out" for e in events)
-            to_event = next(e for e in events if e.kind == "timed_out")
-            assert to_event.payload["limit_seconds"] == 1
-            assert to_event.payload["elapsed_seconds"] >= 30
-        finally:
-            conn.close()
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "timed_out" for e in events)
+        to_event = next(e for e in events if e.kind == "timed_out")
+        assert to_event.payload is not None
+        assert to_event.payload["limit_seconds"] == 1
+        assert to_event.payload["elapsed_seconds"] >= 30
     finally:
-        _kb._pid_alive = original_alive
+        conn.close()
 
 
 

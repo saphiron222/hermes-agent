@@ -116,7 +116,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | scheduled | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`. Adding a link to a running child is rejected because it cannot gate work already claimed; the one exception is an active worker linking its own card, with dispatcher-provided run ownership, immediately before a dependency-block handoff.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -416,6 +416,23 @@ unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
+
+### Automatic recovery from temporary blockers
+
+`kanban_block(kind="transient")` never enters the human `blocked` bucket. It
+lands in `scheduled` with an exponential retry delay (or the explicit
+`retry_after` timestamp/duration). The periodic `recheck-blocks` job returns it
+to the safe source phase when that time arrives.
+
+A worker can also attach a `resume_check` to `capability` or `needs_input`:
+an argv command with an expected exit code, an HTTP URL with an expected status,
+or a file/directory that must be empty. The check fails closed. Only a measured
+pass resumes the card, and the measurement is written to the card as a
+`REPRISE AUTOMATIQUE` comment. Failed polls are silent. A blocker without a
+machine check remains human-owned.
+
+The same-cause breaker still applies: at `BLOCK_RECURRENCE_LIMIT`, automatic
+recovery stops and the card moves to `triage`.
 
 ## Enabling tools for a chat profile
 

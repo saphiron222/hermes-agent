@@ -958,6 +958,17 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    from hermes_cli.kanban_block_recheck import normalize_resume_check, parse_retry_after
+
+    resume_check = None
+    raw_resume_check = getattr(args, "resume_check", None)
+    try:
+        retry_after = parse_retry_after(getattr(args, "retry_after", None))
+        if raw_resume_check:
+            resume_check = json.loads(raw_resume_check)
+            resume_check = normalize_resume_check(resume_check)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _err(f"invalid automatic recovery condition: {exc}")
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -978,7 +989,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            retry_after=retry_after, resume_check=resume_check))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 
@@ -1006,6 +1018,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_recheck_blocks(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err(
+            "kanban recheck-blocks is orchestrator-only; run it from a clean cron environment"
+        )
+    from hermes_cli.kanban_block_recheck import reevaluate_blocked_tasks
+
+    with kbc.connect_closing() as conn:
+        resumed = reevaluate_blocked_tasks(conn)
+    for item in resumed:
+        print(f"Resumed {item.task_id}: {item.measurement}")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1304,6 +1330,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "recheck-blocks": _cmd_recheck_blocks,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

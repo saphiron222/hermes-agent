@@ -300,9 +300,12 @@ _SPECS = [
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
                   "parents finish, no human); 'needs_input'/'capability' go to "
-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
+                  "blocked for a human; 'transient' waits in scheduled and retries. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--retry-after",
+             help="Unix/ISO timestamp or duration (30s, 5m, 2h); transient defaults to backoff"),
+        _arg("--resume-check", help="JSON machine check (command, url, or path_empty)"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -313,6 +316,7 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("recheck-blocks", [], help="Re-evaluate due machine checks and transient retries"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

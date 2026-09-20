@@ -172,7 +172,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "or 'transient' (a flaky failure that may clear; it is scheduled for "
+        "automatic retry instead of sent to a human). ``retry_after`` sets "
+        "when that retry/check may run. ``resume_check`` is an optional "
+        "machine-verifiable condition; a passing check resumes capability or "
+        "needs_input blocks without human intervention. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -192,8 +196,29 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "Why you're blocked. 'dependency' waits in todo and "
                 "resumes automatically when an incomplete parent finishes; "
                 "if no parent is open it is recorded as needs_input instead. "
-                "The others surface to a human. Omit only if none apply."
+                "Transient waits are scheduled automatically. Capability and "
+                "needs_input stay human-owned unless resume_check proves the "
+                "condition cleared. Omit only if none apply."
             ),
+        },
+        "retry_after": {
+            "anyOf": [{"type": "number"}, {"type": "string"}],
+            "description": (
+                "Earliest re-evaluation time: Unix timestamp, ISO timestamp, "
+                "or duration such as '30s', '5m', '2h'. Transient blocks get "
+                "an increasing default backoff when omitted."
+            ),
+        },
+        "resume_check": {
+            "type": "object",
+            "description": (
+                "Optional machine-verifiable recovery condition. Supported "
+                "shapes: command {type:'command', argv:[...], expected_exit_code:0, "
+                "timeout_seconds:10}; URL {type:'url', url:'https://...', "
+                "expected_status:200}; empty file/directory {type:'path_empty', "
+                "path:'...'}. Checks fail closed."
+            ),
+            "additionalProperties": True,
         },
     },
     ["reason"],

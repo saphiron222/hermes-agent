@@ -161,7 +161,7 @@ async def test_suppressed_ping_has_no_sent_receipt_but_wake_executes(tmp_path, m
         tid = kb.create_task(conn, title="failure", assignee="worker", session_id=key)
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="42",
                           user_id="42", chat_type="dm", delivery_mode="notify+wake")
-        kb.block_task(conn, tid, reason="worker failure", kind="transient")
+        kb.block_task(conn, tid, reason="worker lacks a capability", kind="capability")
     finally:
         conn.close()
     work = []

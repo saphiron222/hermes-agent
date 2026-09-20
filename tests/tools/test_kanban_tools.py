@@ -276,6 +276,26 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_transient_reports_scheduled_retry(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    result = json.loads(kt._handle_block({
+        "reason": "host restarting",
+        "kind": "transient",
+        "retry_after": 2_000_000_000,
+    }))
+    assert result["ok"] is True
+    assert result["status"] == "scheduled"
+    assert result["retry_after"] == 2_000_000_000
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "scheduled"
+        assert task.retry_after == 2_000_000_000
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""

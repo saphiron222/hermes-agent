@@ -731,6 +731,8 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    retry_after: Optional[int] = None         # epoch second for transient/check re-evaluation
+    resume_check: Optional[dict] = None       # validated machine-verifiable condition
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -749,6 +751,8 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            retry_after=_opt_int(g("retry_after")),
+            resume_check=_json_or(g("resume_check")),
         )
 
 
@@ -966,7 +970,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Scheduled retry/check time. ``transient`` tasks live in ``scheduled``;
+    -- human blockers remain ``blocked`` and are eligible only with a check.
+    retry_after          INTEGER,
+    -- Canonical JSON for a command, URL status, or empty-path check.
+    resume_check         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2173,7 +2182,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
-        "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+        "'blocked', 'block_loop_detected', 'dependency_wait', 'transient_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
@@ -3180,15 +3189,24 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    retry_after: Any = None, resume_check: Any = None,
 ) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+    """``running``/``ready`` -> a routed wait state (see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition."""
+    promote it into a context-free respawn. ``transient`` waits in ``scheduled``
+    until ``retry_after``; a structured ``resume_check`` lets the re-evaluator
+    recover a human-bucket block only after a machine measurement passes.
+    Recurrences still trip the breaker. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    from hermes_cli.kanban_block_recheck import parse_retry_after, serialize_resume_check
+
+    now = int(time.time())
+    normalized_retry_after = parse_retry_after(retry_after, now=now)
+    serialized_resume_check = serialize_resume_check(resume_check)
+    if normalized_retry_after is not None and kind != "transient" and serialized_resume_check is None:
+        raise ValueError("retry_after requires kind='transient' or a resume_check")
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3208,6 +3226,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            retry_after=normalized_retry_after, resume_check=serialized_resume_check, now=now,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3228,14 +3247,19 @@ def block_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        run_outcome = "scheduled" if new_status == "scheduled" else "blocked"
+        run_status = "scheduled" if new_status == "scheduled" else "blocked"
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome=run_outcome, status=run_status,
+            summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+            return True
+        if new_status == "scheduled":
             return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
@@ -3244,6 +3268,7 @@ def block_task(
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    retry_after: Optional[int], resume_check: Optional[str], now: int,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3251,7 +3276,8 @@ def _route_block(
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Callers that pass ``dependency`` with no
     incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
+    (see :func:`block_task`). ``transient`` waits in ``scheduled`` instead of
+    the human bucket. Every non-dependency kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
@@ -3260,14 +3286,31 @@ def _route_block(
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+        return (
+            "todo", "dependency_wait",
+            "block_kind = ?, block_recurrences = 0, retry_after = NULL, resume_check = NULL",
+            (kind,), payload,
+        )
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+    set_sql = (
+        "block_kind = ?, block_recurrences = ?, retry_after = ?, resume_check = ?"
+    )
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+        return "triage", "block_loop_detected", set_sql, (kind, recurrences, None, None), payload
+    if kind == "transient":
+        from hermes_cli.kanban_block_recheck import transient_retry_at
+
+        due = retry_after if retry_after is not None else transient_retry_at(recurrences, now=now)
+        payload["retry_after"] = due
+        payload["resume_check"] = json.loads(resume_check) if resume_check else None
+        return "scheduled", "transient_wait", set_sql, (kind, recurrences, due, resume_check), payload
+    due = retry_after if retry_after is not None else (now if resume_check else None)
+    if resume_check:
+        payload["retry_after"] = due
+        payload["resume_check"] = json.loads(resume_check)
+    return "blocked", "blocked", set_sql, (kind, recurrences, due, resume_check), payload
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3595,7 +3638,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "retry_after = NULL, resume_check = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:

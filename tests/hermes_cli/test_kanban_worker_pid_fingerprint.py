@@ -7,6 +7,8 @@ must require the spawn-time start fingerprint to match, never bare PID existence
 
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -218,3 +220,110 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def _assert_dead_worker_group_is_gone_before_requeue(board, tmp_path):
+    """A crash may leave a live terminal child; release only after the whole session is gone."""
+    child_pid_file = tmp_path / "child.pid"
+    script = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "sys.exit(7)"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", script, str(child_pid_file)],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while kbd._pid_alive(leader.pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert kbd._pid_alive(leader.pid) is False
+        assert kbd._pid_alive(child_pid) is True
+
+        fingerprint = kbd._process_fingerprint(leader.pid)
+        assert fingerprint is not None  # zombie identity is readable until wait()/reap
+        tid = _claimed_running(board, pid=leader.pid, started_at=fingerprint)
+
+        assert kbd.detect_crashed_workers(board) == [tid]
+        assert kb.get_task(board, tid).status == "ready"
+        assert kbd._process_group_alive(leader.pid) is False
+        assert kbd._pid_alive(child_pid) is False
+    finally:
+        with __import__("contextlib").suppress(ProcessLookupError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        leader.wait(timeout=5)
+
+
+@pytest.mark.linux_only
+def test_linux_dead_worker_group_is_gone_before_requeue(board, tmp_path):
+    _assert_dead_worker_group_is_gone_before_requeue(board, tmp_path)
+
+
+@pytest.mark.macos_only
+def test_macos_dead_worker_group_is_gone_before_requeue(board, tmp_path):
+    _assert_dead_worker_group_is_gone_before_requeue(board, tmp_path)
+
+
+@pytest.mark.windows_only
+def test_windows_dead_worker_tree_is_gone_before_requeue(board, tmp_path):
+    child_pid = None
+    child_pid_file = tmp_path / "child.pid"
+    script = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); sys.exit(7)"
+    )
+    leader = subprocess.Popen([sys.executable, "-c", script, str(child_pid_file)])
+    kbd._live_worker_procs[leader.pid] = leader
+    try:
+        fingerprint = kbd._process_fingerprint(leader.pid)
+        assert fingerprint is not None
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+        leader.wait(timeout=5)
+        tid = _claimed_running(board, pid=leader.pid, started_at=fingerprint)
+
+        assert kbd.detect_crashed_workers(board) == [tid]
+        assert kb.get_task(board, tid).status == "ready"
+        assert kbd._pid_alive(child_pid) is False
+    finally:
+        kbd._live_worker_procs.pop(leader.pid, None)
+        if child_pid is not None:
+            with __import__("contextlib").suppress(Exception):
+                __import__("psutil").Process(child_pid).kill()
+
+
+def test_crash_reclaim_holds_claim_when_worker_group_cannot_be_proven_gone(board, monkeypatch):
+    """An unverifiable surviving group blocks retry instead of creating a second worker."""
+    pid = 424_244
+    tid = _claimed_running(board, pid=pid, started_at="boot-a|123")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kbd, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(kbd, "_worker_identity_matches", lambda *_args: None)
+
+    assert kbd.detect_crashed_workers(board) == []
+    task = kb.get_task(board, tid)
+    assert task is not None and task.status == "running"
+    spawned = []
+    for _ in range(3):
+        result = kbd.dispatch_once(
+            board, spawn_fn=lambda *_args, **_kwargs: spawned.append(True) or 999_999,
+        )
+        assert result.spawned == []
+    assert spawned == []
+    assert board.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 1
+    assert any(
+        event.kind == "reclaim_deferred"
+        and event.payload["reason"] == "crashed_worker_group_alive"
+        for event in kb.list_events(board, tid)
+    )

@@ -421,6 +421,151 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     return _worker_identity_matches(pid, started_at) is False
 
 
+def _process_group_alive(pgid: int) -> bool:
+    """Return whether a POSIX worker session still contains any process."""
+    if os.name != "posix" or pgid <= 0:
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _reap_worker_pid(pid: int) -> None:
+    """Reap one direct worker child and retain its exit classification."""
+    if os.name != "posix":
+        return
+    try:
+        reaped_pid, status = os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return
+    if reaped_pid == int(pid):
+        _record_worker_exit(reaped_pid, status)
+
+
+def _terminate_windows_crashed_worker_tree(pid: int, started_at, info: dict[str, Any]) -> dict[str, Any]:
+    """Terminate descendants of an exited Windows worker while its exact Popen handle is retained."""
+    proc = _live_worker_procs.get(pid)
+    if proc is None or started_at in (None, UNVERIFIED_WORKER_FINGERPRINT):
+        info["signal_refused"] = True
+        info["identity_unreadable"] = True
+        return info
+    try:
+        import psutil  # type: ignore
+
+        root_started = int(str(started_at).rsplit("|", 1)[-1])
+        rows = list(psutil.process_iter(["pid", "ppid", "create_time"]))
+        by_parent: dict[int, list[Any]] = {}
+        for child in rows:
+            # A stale process whose recorded parent number predates this exact worker is not ours.
+            if int(round(float(child.info["create_time"] or 0) * 100)) < root_started:
+                continue
+            by_parent.setdefault(int(child.info["ppid"] or 0), []).append(child)
+        descendants: list[Any] = []
+        frontier = [pid]
+        while frontier:
+            parent = frontier.pop()
+            for child in by_parent.get(parent, ()):
+                descendants.append(child)
+                frontier.append(int(child.pid))
+    except Exception:
+        info["signal_refused"] = True
+        info["identity_unreadable"] = True
+        return info
+
+    info["termination_attempted"] = bool(descendants)
+    for child in reversed(descendants):
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            child.terminate()
+    _gone, alive = psutil.wait_procs(descendants, timeout=0.5)
+    for child in alive:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            child.kill()
+    _gone, alive = psutil.wait_procs(alive, timeout=0.5)
+    if alive:
+        return info
+    returncode = proc.poll()
+    if returncode is not None:
+        _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+        _live_worker_procs.pop(pid, None)
+    info["terminated"] = True
+    return info
+
+
+def _terminate_crashed_worker_group(
+    pid: int, claim_lock: Optional[str], started_at,
+) -> dict[str, Any]:
+    """Ensure a dead POSIX worker left no live descendants before retry.
+
+    The launch fingerprint must still match the zombie leader before its process group is
+    signalled. If the leader was already reaped while its group remains alive, identity is no
+    longer provable: hold the claim instead of risking an unrelated group or spawning beside the
+    surviving command.
+    """
+    info: dict[str, Any] = {
+        "prev_pid": int(pid), "host_local": False, "termination_attempted": False,
+        "terminated": False, "sigkill": False,
+    }
+    if not claim_lock or not str(claim_lock).startswith(_kb._host_prefix()):
+        return info
+    info["host_local"] = True
+    if _kb._IS_WINDOWS:
+        return _terminate_windows_crashed_worker_tree(pid, started_at, info)
+    if os.name != "posix" or not _process_group_alive(pid):
+        info["terminated"] = True
+        return info
+    # killpg targets the numeric group id ``pid`` (not whatever group a process currently using
+    # that PID belongs to). Refusing our own group id is therefore the self-signal guard; on macOS
+    # getpgid(zombie_pid) is already ESRCH even though the dead leader's group still has children.
+    if pid == os.getpgrp():
+        info["signal_refused"] = True
+        info["current_process_group"] = True
+        return info
+    # NULL is a legacy bare-PID row. It preserves old liveness semantics but never grants new
+    # process-group signal authority; a group can outlive its leader and the numeric id may be old.
+    if started_at is None or started_at == UNVERIFIED_WORKER_FINGERPRINT or (
+        _worker_identity_matches(pid, started_at) is not True
+    ):
+        info["signal_refused"] = True
+        info["identity_unreadable"] = True
+        return info
+
+    info["termination_attempted"] = True
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError:
+        return info
+
+    # The leader is normally a zombie here. Reap it only after proving its fingerprint and
+    # retain the status so the crash classifier still distinguishes rc=0/rate-limit/nonzero.
+    _reap_worker_pid(pid)
+    for _ in range(10):
+        if not _process_group_alive(pid):
+            info["terminated"] = True
+            return info
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        info["sigkill"] = True
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError:
+        return info
+    for _ in range(10):
+        if not _process_group_alive(pid):
+            info["terminated"] = True
+            return info
+        time.sleep(0.05)
+    return info
+
+
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     """``signal_fn`` test hook, else ``os.kill`` when the platform has one."""
     if signal_fn is not None:
@@ -1166,29 +1311,36 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
-    with _kb.write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = _kb._host_prefix()
-        for row in rows:
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
-                continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
-                continue
+    rows = conn.execute(
+        "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+        "FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = _kb._host_prefix()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        started_at = _kb._row_get(row, "started_at")
+        if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
+            continue
+        fingerprint = _kb._row_get(row, "worker_started_at")
+        if _worker_alive(row["worker_pid"], fingerprint):
+            continue
 
-            pid = int(row["worker_pid"])
+        pid = int(row["worker_pid"])
+        termination = _terminate_crashed_worker_group(pid, row["claim_lock"], fingerprint)
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], int(time.time()), termination,
+                reason="crashed_worker_group_alive",
+            )
+            continue
+
+        with _kb.write_txn(conn):
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            dead.event_payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2167,13 +2319,15 @@ def _run_reclaim_phase(
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
-    reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    # Inspect crashes before the generic waitpid sweep reaps zombie leaders: their spawn
+    # fingerprint authorizes cleanup of any terminal/SSH descendants left in the worker group.
+    result.crashed = detect_crashed_workers(conn, board=board)
+    reap_worker_zombies()
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))

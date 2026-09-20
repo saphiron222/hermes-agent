@@ -90,7 +90,7 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="loop", assignee="a")
         for i in range(kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT):
-            _dead_worker_with_log(conn, tid, 71000 + i, 0)
+            _dead_worker_with_log(conn, tid, 900_000 + i, 0)
             kbd.detect_crashed_workers(conn)
             kb.recompute_ready(conn, failure_limit=10)
         task = kb.get_task(conn, tid)

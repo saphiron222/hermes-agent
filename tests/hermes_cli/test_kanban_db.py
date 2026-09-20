@@ -407,7 +407,7 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
             assert kb.request_review(conn, tid, summary="done", reviewer="r",
                                      expected_run_id=claimed.current_run_id)
             assert kb.claim_review_task(conn, tid, claimer=f"{host}:r0") is not None
-        pid = 71000
+        pid = 910_000
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         _kbd._record_worker_exit(pid, _exited_status(_kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE))

@@ -282,6 +282,38 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decompose_fanout_false_reassigns_unavailable_existing_owner(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="replace dead owner", assignee="dead", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "Keep the work runnable.",
+        "assignee": "dead",
+    })
+
+    patches = _patch_list_profiles(["healthy", "dead"], unavailable={"dead"})
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {"default_assignee": "healthy"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "healthy"
+
+
 def test_load_routing_falls_back_to_defaults_when_config_unreadable(kanban_home, monkeypatch):
     """decompose_task promises ok=False on expected failures; a config read that raises (missing
     profile home, HomeInitializationError) must not escape _load_routing as an exception."""

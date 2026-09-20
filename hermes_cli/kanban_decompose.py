@@ -244,7 +244,7 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
-    if not task.assignee:
+    if not task.assignee or task.assignee not in routing.valid_names:
         assignee_val = _normalize_assignee_choice(
             parsed.get("assignee"), default_assignee=routing.default_assignee, valid_names=routing.valid_names,
         )

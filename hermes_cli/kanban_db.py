@@ -1453,6 +1453,62 @@ def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]
     return [p for p in ids if p not in present]
 
 
+# Correctif local (19/09/2026) — le canal de notification suit le SUJET, jamais le parent.
+#
+# `_inherit_notify_subs` recopiait `notifier_profile` verbatim : une carte `dev` qui
+# engendrait des enfants sur le site leur transmettait son canal, et le travail du site
+# venait parler dans le canal produit. Le defaut est mecanique et se reproduisait a
+# chaque decomposition. Ici on corrige apres la copie, d'apres le depot du workspace.
+#
+# Editer cette table pour ajouter un depot ; une entree non listee garde le canal herite.
+CANAL_PAR_DEPOT: tuple[tuple[str, str], ...] = (
+    ("/memlia-landing", "marketing"),
+    ("/memlia-desk", "dev"),
+    ("/dev/produit/", "dev"),
+    ("/dev/produit-banque/", "dev"),
+    ("/memlia-vault", "default"),
+    ("/.hermes", "default"),
+    ("/memlia-fiscal", "default"),
+)
+# Volontairement ABSENT : "/dev/interne" nu. Le test est une sous-chaine, et ce
+# dossier contient aussi memlia-facturation, previsionnel et specs — une ligne
+# fourre-tout y enverrait tout le canal marketing. On route depot par depot.
+
+
+def _canal_pour_workspace(workspace_path: Optional[str]) -> Optional[str]:
+    """Profil qui doit notifier, deduit du depot ou la carte travaille.
+
+    ``None`` quand le chemin est vide ou ne correspond a aucun depot connu : on
+    laisse alors le canal herite du parent, comportement d'origine.
+    """
+    if not workspace_path:
+        return None
+    for motif, profil in CANAL_PAR_DEPOT:
+        if motif in workspace_path:
+            return profil
+    return None
+
+
+def _corriger_canal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Force le canal des abonnements d'une carte sur celui de son depot.
+
+    Sans effet quand le depot n'est pas dans ``CANAL_PAR_DEPOT`` : le canal pose
+    explicitement est alors conserve. Retourne le canal applique, ou ``None``.
+    """
+    ligne = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    canal = _canal_pour_workspace(ligne["workspace_path"] if ligne is not None else None)
+    if not canal:
+        return None
+    conn.execute(
+        "UPDATE kanban_notify_subs SET notifier_profile = ? "
+        " WHERE task_id = ? AND COALESCE(notifier_profile, '') <> ?",
+        (canal, task_id, canal),
+    )
+    return canal
+
+
 def _inherit_notify_subs(
     conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
     created_at: Optional[int] = None,
@@ -1469,6 +1525,9 @@ def _inherit_notify_subs(
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
+        # Une carte racine n'herite de rien, mais son canal doit quand meme
+        # suivre son depot : la sortie anticipee sautait la correction.
+        _corriger_canal(conn, child_id)
         return
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?", (child_id,),
@@ -1489,6 +1548,8 @@ def _inherit_notify_subs(
         """,
         (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
     )
+
+    _corriger_canal(conn, child_id)
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:

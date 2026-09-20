@@ -28,7 +28,11 @@ is left completely untouched.
 
 from __future__ import annotations
 
+import ast
+import json
 import os
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -154,6 +158,117 @@ class TestKanbanGatesRespectContext:
         assert kanban_tools._check_kanban_mode() is True
         with non_dispatcher_owned_context():
             assert kanban_tools._check_kanban_mode() is False
+
+    def test_task_tools_stay_hidden_when_profile_enables_kanban(
+        self, monkeypatch, worker_env
+    ):
+        """A profile opt-in must not restore the inherited worker authority."""
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        monkeypatch.setattr(kanban_tools, "_profile_has_kanban_toolset", lambda: True)
+        with non_dispatcher_owned_context():
+            assert kanban_tools._check_kanban_mode() is False
+            assert kanban_tools._check_kanban_orchestrator_mode() is False
+
+    def test_cached_worker_tool_verdict_does_not_leak_into_cron(self, worker_env):
+        """The registry's process-wide check_fn cache must not restore the tools."""
+        from types import SimpleNamespace
+
+        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.agent_init import _load_tools
+        import model_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        model_tools._tool_defs_cache.clear()
+        worker_tools = model_tools.get_tool_definitions(
+            enabled_toolsets=["kanban"], quiet_mode=True
+        )
+        assert "kanban_show" in {
+            tool["function"]["name"] for tool in worker_tools
+        }
+
+        with non_dispatcher_owned_context():
+            cron_tools = model_tools.get_tool_definitions(
+                enabled_toolsets=["kanban"], quiet_mode=True
+            )
+            cron_agent = SimpleNamespace(quiet_mode=True)
+            _load_tools(cron_agent, ["kanban"], [])
+
+        cron_names = {tool["function"]["name"] for tool in cron_tools}
+        assert not any(name.startswith("kanban_") for name in cron_names)
+        assert cron_agent._kanban_worker_guidance == ""
+
+    def test_stop_nudge_hidden_from_cron_agent(self, worker_env):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.kanban_stop import kanban_stop_nudge_enabled
+
+        assert kanban_stop_nudge_enabled() is True
+        with non_dispatcher_owned_context():
+            assert kanban_stop_nudge_enabled() is False
+
+    def test_explicit_mutation_rejected_from_cron_agent(self, worker_env):
+        """A stale schema or explicit task id cannot recover the parent's authority."""
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        with non_dispatcher_owned_context(), pytest.raises(kanban_tools._Reject):
+            kanban_tools._worker_guard(
+                "kanban_complete", {"task_id": "t_worker_real_task"}
+            )
+
+    def test_cron_child_env_scrubs_kanban_identity_but_keeps_profile(
+        self, worker_env
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools.environments.local import build_subprocess_env
+
+        base = dict(os.environ)
+        base["HERMES_HOME"] = "/tmp/profile-home"
+        with non_dispatcher_owned_context():
+            child_env = build_subprocess_env(base=base)
+
+        assert not any(key.startswith("HERMES_KANBAN_") for key in child_env)
+        assert child_env["HERMES_HOME"] == "/tmp/profile-home"
+
+    def test_no_scrub_cron_child_drops_all_kanban_vars_only(
+        self, monkeypatch, worker_env
+    ):
+        """The mono-profile external worker uses the no-scrub factory path."""
+        from tools.environments.local import build_subprocess_env
+
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        monkeypatch.setenv("HERMES_KANBAN_FUTURE_CAPABILITY", "must-not-leak")
+        monkeypatch.setenv("CRON_NO_SCRUB_SENTINEL", "must-survive")
+        parent_before = dict(os.environ)
+
+        child_env = build_subprocess_env(scrub_secrets=False)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os; "
+                    "print(json.dumps({"
+                    "'kanban': sorted(k for k in os.environ if k.startswith('HERMES_KANBAN_')), "
+                    "'home': os.environ.get('HERMES_HOME'), "
+                    "'sentinel': os.environ.get('CRON_NO_SCRUB_SENTINEL')}))"
+                ),
+            ],
+            env=child_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(probe.stdout)
+
+        assert observed == {
+            "kanban": [],
+            "home": "/tmp/profile-home",
+            "sentinel": "must-survive",
+        }
+        assert dict(os.environ) == parent_before
 
     def test_complete_does_not_default_to_worker_task(self, worker_env):
         """The damage path: kanban_complete must not inherit the task id."""

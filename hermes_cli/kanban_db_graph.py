@@ -166,6 +166,21 @@ def decompose_triage_task(
     return child_ids
 
 
+
+def _repo_root_from_workspace(root_path: Optional[str], child_id: str) -> Optional[str]:
+    """``<racine du depot du parent>/.worktrees/<child_id>``, ou ``None``.
+
+    Le parent pointe soit sur la racine d'un depot, soit sur un worktree
+    ``<depot>/.worktrees/<id>``. Dans les deux cas la racine se deduit du chemin,
+    sans toucher au disque. ``None`` quand le parent n'a pas de chemin : on
+    retombe alors sur l'ancre du tableau, comportement d'origine.
+    """
+    if not root_path:
+        return None
+    marqueur = "/.worktrees/"
+    racine = root_path.split(marqueur, 1)[0] if marqueur in root_path else root_path.rstrip("/")
+    return f"{racine}/.worktrees/{child_id}" if racine else None
+
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
     author: Optional[str], now: int,
@@ -186,15 +201,21 @@ def _insert_decomposed_child(
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
+    new_id = _new_task_id()
     if child.get("workspace_path"):
         child_ws_path = child.get("workspace_path")
     elif child_ws_kind == "worktree":
-        child_ws_path = None
+        # Correctif local Memlia (15/09/2026, re-porte le 20/09) : ancrer le worktree de
+        # l'enfant sur le DEPOT DU PARENT, pas sur l'ancre du tableau. Laisser None faisait
+        # materialiser le worktree dans le depot par defaut — sept cartes Ressources/blog ont
+        # atterri dans memlia-desk alors que leur source vivait dans memlia-landing. Un
+        # worktree DISTINCT par enfant est conserve (l'isolation des freres reste entiere) ;
+        # seule la racine du depot est heritee.
+        child_ws_path = _repo_root_from_workspace(root_row["workspace_path"], new_id)
     elif child_ws_kind == root_ws_kind:
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
-    new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "

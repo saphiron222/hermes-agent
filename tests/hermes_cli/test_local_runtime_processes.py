@@ -233,3 +233,98 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
             proc._handle.Close()
         for job in jobs:
             job.close()
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize('cleanup_failure', ['kill', 'wait', 'close'])
+def test_failed_setup_retains_native_handles_then_retries_cleanup(
+    tmp_path, monkeypatch, cleanup_failure,
+):
+    import ctypes
+    from ctypes import wintypes
+    from hermes_cli.local_runtime import processes
+
+    marker = tmp_path / 'child executed'
+    jobs, children = [], []
+    real_init = processes._WindowsJob.__init__
+    real_assign = processes._WindowsJob.assign
+    real_popen = processes.subprocess.Popen
+    original_methods = {}
+
+    def track_job(job):
+        real_init(job)
+        jobs.append(job)
+
+    def tracked_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        children.append(proc)
+        original_methods['kill'] = proc.kill
+        original_methods['wait'] = proc.wait
+        if cleanup_failure == 'kill':
+            proc.kill = lambda: (_ for _ in ()).throw(OSError('injected kill failure'))
+        elif cleanup_failure == 'wait':
+            proc.wait = lambda timeout: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(proc.args, timeout))
+        return proc
+
+    def assign_then_fail(job, proc):
+        if cleanup_failure == 'close':
+            real_assign(job, proc)
+            original_methods['close'] = job._api.CloseHandle
+            job._api.CloseHandle = lambda _handle: False
+        else:
+            raise OSError('injected assignment failure')
+
+    monkeypatch.setattr(processes, '_pending_windows_cleanups', [])
+    monkeypatch.setattr(processes._WindowsJob, '__init__', track_job)
+    monkeypatch.setattr(processes._WindowsJob, 'assign', assign_then_fail)
+    monkeypatch.setattr(processes.subprocess, 'Popen', tracked_popen)
+    if cleanup_failure == 'close':
+        monkeypatch.setattr(
+            psutil.Process, 'resume',
+            lambda _self: (_ for _ in ()).throw(KeyboardInterrupt('injected resume failure')),
+        )
+    cmd = [sys.executable, '-c', 'from pathlib import Path; import sys; '
+           'Path(sys.argv[1]).write_text("ran")', str(marker)]
+
+    try:
+        with pytest.raises(processes.WindowsSpawnCleanupPending):
+            processes.spawn_server(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        assert not marker.exists()
+        assert len(processes._pending_windows_cleanups) == 1
+        cleanup = processes._pending_windows_cleanups[0]
+        assert cleanup.proc is children[0] and cleanup.job is jobs[0]
+        assert not children[0]._handle.closed
+
+        with pytest.raises(processes.WindowsSpawnCleanupPending):
+            processes.spawn_server(cmd)
+        assert len(children) == 1, 'uncertain cleanup allowed a concurrent retry'
+
+        children[0].kill = original_methods['kill']
+        children[0].wait = original_methods['wait']
+        if cleanup_failure == 'close':
+            jobs[0]._api.CloseHandle = original_methods['close']
+        job_handle = jobs[0]._handle
+        assert processes._retry_pending_windows_cleanups() is True
+        assert processes._pending_windows_cleanups == []
+        assert children[0].poll() is not None
+        assert children[0]._handle.closed
+
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        api.GetHandleInformation.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        api.GetHandleInformation.restype = wintypes.BOOL
+        flags = wintypes.DWORD()
+        assert not api.GetHandleInformation(job_handle, ctypes.byref(flags))
+    finally:
+        for proc in children:
+            proc.kill = original_methods.get('kill', proc.kill)
+            proc.wait = original_methods.get('wait', proc.wait)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+        for job in jobs:
+            if cleanup_failure == 'close' and 'close' in original_methods:
+                job._api.CloseHandle = original_methods['close']
+            job.close()

@@ -293,6 +293,9 @@ def reap_worker_zombies() -> "list[int]":
     there), so the rate-limit sentinel exit is classified on both hosts."""
     reaped: "list[int]" = []
     if _kb._IS_WINDOWS:
+        from hermes_cli.local_runtime.processes import _retry_pending_windows_cleanups
+
+        _retry_pending_windows_cleanups()
         for pid, proc in list(_live_worker_procs.items()):
             returncode = proc.poll()
             if returncode is None:
@@ -2256,13 +2259,20 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        from hermes_cli.local_runtime.processes import WindowsSpawnCleanupPending
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # A host refusal or an uncertain failed-spawn cleanup means nothing about
+        # the card ran. Neither may spend its retry budget; the infrastructure
+        # cooldown also prevents a concurrent retry while cleanup is unresolved.
+        infrastructure = isinstance(
+            exc, (RestartSafeScopeUnavailable, WindowsSpawnCleanupPending),
+        )
         if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+            _kb._log.warning(
+                "kanban dispatcher: spawn of %s deferred by infrastructure: %s",
+                claimed.id, exc,
+            )
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,

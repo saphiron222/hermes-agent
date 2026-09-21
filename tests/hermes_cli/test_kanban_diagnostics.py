@@ -134,6 +134,39 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert d.detail.endswith("…") or len(d.detail) < 700
 
 
+def test_repeated_crashes_clear_after_a_non_crash_terminal_outcome():
+    """A later blocked/review result proves the worker got past the crash
+    loop, so older crashes must not remain an active attention banner."""
+    task = _task(status="todo")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="missing skill"),
+        _run(outcome="crashed", run_id=2, error="missing skill"),
+        _run(outcome="blocked", run_id=3),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert not any(d.kind == "repeated_crashes" for d in diags)
+
+
+def test_block_unblock_cycling_is_not_active_after_task_completion():
+    """Historical recovery churn is useful in the event log, but a terminal
+    task no longer requires operator attention."""
+    now = 100_000
+    events = []
+    for offset in (60, 50, 40):
+        events.extend([
+            _event("unblocked", ts=now - offset),
+            _event("blocked", ts=now - offset + 1),
+        ])
+
+    active = kd.compute_task_diagnostics(_task(status="ready"), events, [], now=now)
+    terminal = kd.compute_task_diagnostics(_task(status="done"), events, [], now=now)
+
+    assert any(d.kind == "block_unblock_cycling" for d in active)
+    assert not any(d.kind == "block_unblock_cycling" for d in terminal)
+
+
 # ---------------------------------------------------------------------------
 # Severity sorting
 # ---------------------------------------------------------------------------

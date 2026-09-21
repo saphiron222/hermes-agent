@@ -465,8 +465,10 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))
-    # Count trailing consecutive 'crashed' outcomes; a success (or manual
-    # reclaim) breaks the streak, other outcomes neither count nor break it.
+    # Count trailing consecutive ``crashed`` outcomes. Any newer terminal
+    # outcome breaks the streak: once a worker has reached blocked, review, or
+    # completion, the old crashes are historical rather than an active crash
+    # loop. Missing outcomes are ignored for compatibility with old rows.
     consecutive = 0
     last_err = None
     for r in _runs_newest_first(runs):
@@ -475,7 +477,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
+        elif outcome:
             break
     if consecutive < threshold:
         return []
@@ -630,6 +632,11 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     cycles every few minutes is invisible to it regardless of how many times it cycles (#29747 gap 1). This
     rule complements that one by counting block→unblock cycles in a sliding window.
     """
+    # This is an intervention signal, not a post-mortem badge. Once the task
+    # is terminal there is nothing left for an operator to unblock.
+    if _task_field(task, "status") in ("done", "archived"):
+        return []
+
     threshold = _positive_int(cfg.get("block_cycle_threshold"), 3)
     window_seconds = float(cfg.get("block_cycle_window_seconds", 24 * 3600))
     cycle_cutoff = now - window_seconds
